@@ -12,6 +12,7 @@ A Discord bot for a *Police Chief* mobile-game community. It welcomes newcomers,
 - **Games** — Rock-Paper-Scissors, Cops & Robbers (opt-in: you're only drafted or messaged about it if you join the roster), Rogue RoboCop, with leaderboards.
 - **Quiet by design** — it only DMs you about things you asked for or that concern you (your registration, a rank request, a warning, a game you joined). No "welcome back" nudges, no daily digests when nothing happened.
 - **Moderation** — warnings, timeouts, a "prison" channel, bans and kicks, every one logged with an undo button.
+- **Fresh start** — staff can wipe everything the bot stores about one person (and lift their ban) with one click, so they can register again from scratch — optionally with a one-use invite sent to them.
 - **Self-checks** — on every startup it checks the server's roles and channels and reports problems to the staff-only `#logs` channel.
 
 ## It will never ask you for
@@ -34,6 +35,7 @@ Passwords, login codes, account emails, or payment — ever. If anything claimin
 
 - **Google Translate** — only when someone asks for a translation (🌐 or a non-English onboarding), the text being translated is sent to Google's official Cloud Translation API. Nothing is saved.
 - **Datamuse** (a free rhyming-dictionary service, api.datamuse.com) — once, when you finish registering, your in-game name is sent to it to find rhyming words for your welcome rhyme in the everyone-chat. Only the name goes out; nothing is saved. The rhymes are the bot's own lines, not song lyrics.
+- **An AI service — optional, off unless configured.** If the owner sets `AI_PROVIDER` and `AI_API_KEY` in `.env` (Google Gemini, Groq, OpenRouter, Anthropic, any OpenAI-compatible API, or Ollama running on the owner's own machine), a question typed into `/help question:…` or asked as `@RoboCop …` that the bot's built-in guide can't answer is sent to that service together with the bot's own command list, to write a short answer. Only the question text and the asker's rank tier go out — no names, IDs or other messages. Without it, the bot simply says it doesn't know that one yet.
 - Posts in `#🐛-bugs` and `#💡-suggestions` are copied into the staff `#logs` channel so staff see them.
 - The bot notices when you come online so it can send the odd stats reminder, but it doesn't record it.
 
@@ -49,6 +51,7 @@ Passwords, login codes, account emails, or payment — ever. If anything claimin
 - **Create Private Threads, Send Messages in Threads, Manage Threads** — each Cops & Robbers round gets a private cops-only thread for the hourly clues (instead of a DM per cop per hour). Without these it falls back to DMs.
 - **Kick, Ban, Moderate Members, Manage Messages** — moderation tools, used by staff commands (and a few automatic safety rules, all logged). Manage Messages also lets staff pin the `/safety` notice.
 - **View Audit Log** — so the `#visitors` log can tell "left" apart from "kicked" or "banned".
+- **Create Invite** — only for the staff "fresh start + invite back" button, which makes a one-use, 7-day invite for one person.
 
 ## One file not published
 
