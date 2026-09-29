@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 # ============================================================
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+ROBOCOP_VERSION = "10.0"   # bump on every release: the precinct-wide announcement only fires when this changes
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # ------------------------------------------------------------
@@ -925,6 +926,15 @@ def init_db():
                 user_id INTEGER PRIMARY KEY
             )
         """)
+        # 10.0: Cops & Robbers is OPT-IN. Only people on this roster get
+        # drafted (and DMed). chase_opt_outs is kept for the one-time
+        # migration and as a "never ask me again" marker.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chase_opt_ins (
+                user_id INTEGER PRIMARY KEY,
+                joined_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         # NEW: Innovator badge — persistent record of who tested the server
         # during its early phase, independent of the role itself (which
         # could get wiped along with everything else during testing). If
@@ -1019,6 +1029,12 @@ def init_db():
             cursor.execute("ALTER TABLE chase_rounds ADD COLUMN announcement_msg_id INTEGER")
         except sqlite3.OperationalError:
             pass
+        # 10.0: the cops' private thread for the round (clues go there instead
+        # of one DM per cop per hour). NULL = fall back to DMs.
+        try:
+            cursor.execute("ALTER TABLE chase_rounds ADD COLUMN cop_thread_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
     print("[SYSTEM] 🤖 Database loaded successfully. Robocop's brain is online.")
 
@@ -1087,15 +1103,13 @@ import contextlib
 # Cheap, read-only commands that keep working while busy. Everything
 # else touches roles, nicknames, games or the database and gets gated.
 BUSY_EXEMPT_COMMANDS = {
-    "robocop", "abilities", "language", "timezone", "game-stats", "stats", "leaderboard",
-    "monthly-standings", "alliance-leaderboard", "chase-status", "warnings", "show-banned",
-    "show-role", "show-db-fields", "show-field", "server-stats",
+    "help", "safety", "language", "timezone", "stats", "record", "lookup",
 }
 # Staff can ALWAYS run these, busy or not — emergency/moderation tools
 # (a raid doesn't wait politely for a merge to finish) and anything that
 # REDUCES load, like ending a game.
-BUSY_STAFF_ALWAYS = {"killswitch", "imprison", "warn", "pardon", "unban", "end-chase", "game-end"}
-BUSY_GAME_COMMANDS = {"rps", "arrest", "ambush", "join-chase", "leave-chase", "catch", "start-chase", "game-start", "game-restart"}
+BUSY_STAFF_ALWAYS = {"killswitch", "imprison", "warn", "pardon", "game"}
+BUSY_GAME_COMMANDS = {"rps", "arrest", "ambush", "chase", "catch", "game"}
 
 BUSY_REPLIES = [
     "⏳ Hold your horses, Chief — I'm **{reason}** right now. Give me a few minutes and try that again.",
@@ -1335,7 +1349,7 @@ async def busy_watchdog():
                     # General-chat only hears about deliberate admin operations. Auto-detected
                     # rate-limit/DB periods can come and go every few minutes on a busy day —
                     # announcing each one would be exactly the spam we're trying to avoid.
-                    ch = discord.utils.get(guild.text_channels, name="💬-general-chat") if _busy["was_public"] else None
+                    ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE) if _busy["was_public"] else None
                     if ch:
                         try:
                             await ch.send(random.choice(BUSY_ANNOUNCE_START).format(reason=_busy["reason"]))
@@ -1351,7 +1365,7 @@ async def busy_watchdog():
                     pass
                 if _is_leader and _busy.get("announced"):
                     for guild in bot.guilds:
-                        ch = discord.utils.get(guild.text_channels, name="💬-general-chat") if _busy.get("was_public") else None
+                        ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE) if _busy.get("was_public") else None
                         if ch:
                             try:
                                 await ch.send(random.choice(BUSY_ANNOUNCE_END).format(mins=_busy_elapsed_text()))
@@ -1369,7 +1383,7 @@ bot.tree.interaction_check = busy_gate
 # Cooldown so a flaky connection bouncing offline/online doesn't spam staff
 # with reminders — still fires roughly "each time they come online" without
 # being obnoxious about it.
-STAFF_ONLINE_REMINDER_COOLDOWN_MINUTES = 30
+STAFF_ONLINE_REMINDER_COOLDOWN_MINUTES = 24 * 60  # once a day is plenty (10.0; was 30 min)
 
 # /announce cooldowns — staff get none at all (checked via is_staff_member,
 # not this dict). R5s announcing to their own alliance get the shorter one.
@@ -1414,7 +1428,7 @@ TOP10_ARRIVAL_DESCRIPTORS = [
 #  COPS & ROBBERS — a secret-identity manhunt. Cops get escalating poetic
 #  clues every hour about the robbers still at large; robbers get nothing
 #  but their wits. Either side can end the other's run early with a
-#  well-guessed nickname. Runs in #💬-general-chat so it's visible to
+#  well-guessed nickname. Runs in #🌍-everyone-chat so it's visible to
 #  everyone, even people not playing.
 # ------------------------------------------------------------
 try:
@@ -1573,6 +1587,14 @@ ROGUE_BOT_IDENTITIES = [
             "I'm on the fence about this whole situation. Get it? Waffles? ...I'll see myself out.",
         ],
     },
+]
+
+ROGUE_RHYME_TEMPLATES = [
+    "*ahem* — {name}, {name}, rhymes with {rhyme}... a totally normal human observation, carry on.",
+    "Roses are red, my circuits are... also red. {name} said something, and it rhymed with {rhyme}. Poetry.",
+    "Dear diary: {name} spoke today. I thought of {rhyme}. Nobody suspects a thing.",
+    "🎤 {name} in the chat, cool as a {rhyme} / definitely not a robot, just passing the time.",
+    "If I were hiding — which I'm not — I'd say {name} rhymes with {rhyme} and then change the subject. Anyway, weather's nice.",
 ]
 
 ROGUE_BOT_FILLER_LINES = [
@@ -1739,6 +1761,26 @@ DICTATOR_COLOR = discord.Color.gold()
 #  everywhere.
 # ------------------------------------------------------------
 ROLE_MEMBER = "🚔 On The Beat"
+
+# ------------------------------------------------------------
+#  THE ONE CHAT FOR EVERYONE (10.0). Every server, every alliance, one
+#  room — it has to be impossible to miss, so it lives alone in its own
+#  category pinned to the very top of the server. Discord forces channel
+#  names to lower case, so the emoji, the category and the topic are what
+#  make it stand out. Older servers still called it 💬-general-chat; the
+#  startup infrastructure pass renames it in place (history is kept).
+# ------------------------------------------------------------
+CH_EVERYONE = "🌍-everyone-chat"
+CH_EVERYONE_LEGACY = "💬-general-chat"
+CAT_EVERYONE = "🌍 EVERYONE · ALL SERVERS · ALL ALLIANCES"
+CH_EVERYONE_TOPIC = "🌍 THE chat for everyone — every game server, every alliance, one room. New arrivals get a welcome rhyme here. Alliance-only talk lives in your alliance's own channels."
+CH_EVERYONE_NOTICE = (
+    "🌍 **THIS IS THE CHAT FOR EVERYONE.**\n"
+    "Every game server, every alliance, one room. Say hi, trade tips, talk trash (nicely).\n"
+    "• Cops & Robbers runs here daily, and the Rogue RoboCop hides here too.\n"
+    "• Your alliance's private talk lives in your own `[TAG] CHATS` channels.\n"
+    "• New here? `/help` shows everything you can do, and **#⚙️-settings** is where you personalise things (language, time zone, name)."
+)
 # Green here is deliberately a "something's off" signal, not a normal
 # resting state — anyone with an alliance should show that alliance's
 # color instead (alliance roles sit above Member in the hierarchy, so
@@ -1961,10 +2003,8 @@ SENIOR_STAFF_ROLE_NAMES = {ROLE_SENATOR, ROLE_DICTATOR}
 
 
 NAME_CHANGE_REMINDER = (
-    "✏️ **Heads up, Chief:** your name here should always match your in-game name — and you can change it any time. "
-    "If you ever change your name *in the game*, change it here too: just type `/change-nick` "
-    "(takes ten seconds and keeps your [TAG] and server intact).\n"
-    "📚 And always check {abilities} to see what you can do here."
+    "✏️ Your name here should always match your in-game name. Changed it in the game, or made a typo? "
+    "`/fix-me` updates it in ten seconds. And `/help` shows everything you can do here."
 )
 
 
@@ -2140,7 +2180,7 @@ async def get_user_splash_channels(guild, user_id: int) -> list:
     moderation events land somewhere the community actually notices,
     not just the staff-only #logs."""
     channels = []
-    general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+    general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
     if general_ch:
         channels.append(general_ch)
 
@@ -2324,7 +2364,7 @@ CONFIGURABLE_SETTINGS = {
     "founders_pass_threshold": {"default": 10, "type": int, "min": 0, "max": 100, "label": "Founder's Pass — how many alliances get it"},
     "founders_pass_max_server_size": {"default": 15, "type": int, "min": 0, "max": 200, "label": "Founder's Pass — only applies while total alliances are under this"},
     "nickname_maintenance_hour": {"default": 4, "type": int, "min": 0, "max": 23, "label": "Daily nickname maintenance hour (0-23, local time)"},
-    "game_stats_hour": {"default": 0, "type": int, "min": 0, "max": 23, "label": "Daily /game-stats digest post hour (0-23, local time; 0 = midnight)"},
+    "game_stats_hour": {"default": 18, "type": int, "min": 0, "max": 23, "label": "Weekly Precinct Report hour on Sundays (0-23, local time)"},
     "monthly_champion_hour": {"default": 0, "type": int, "min": 0, "max": 23, "label": "Monthly Champion announcement hour, on the 1st of each month (0-23, local time; 0 = midnight)"},
     "timezone": {"default": "America/Los_Angeles", "type": str, "label": "Server's operating timezone (IANA name, e.g. America/Los_Angeles)"},
     "innovator_max_grants": {"default": 50, "type": int, "min": 0, "max": 999999, "label": "Innovator badge — first N total registrants qualify"},
@@ -2509,7 +2549,7 @@ async def maybe_grant_innovator(guild, member, server_nums: list):
     # 🌟 Fanfare — a public moment, plus a genuine, personal thank-you in
     # DM. This badge is tied to their Discord ID specifically, not this
     # one server, so the DM says so.
-    general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+    general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
     if general_ch:
         try:
             await general_ch.send(embed=discord.Embed(
@@ -2976,7 +3016,7 @@ async def announce_version_handoff(guild):
     embed.add_field(
         name="📋 YOUR FIELD MANUAL",
         value=(
-            "Run `/abilities` any time (also posts in #❓-abilities) for a full, personalized rundown of "
+            "Run `/help` any time for a full, personalized rundown of "
             "everything you're cleared to do — commands, rank privileges, all of it, no guesswork required."
         ),
         inline=False
@@ -2984,9 +3024,9 @@ async def announce_version_handoff(guild):
     embed.add_field(
         name="🚔 ACTIVE OPERATIONS — COPS & ROBBERS",
         value=(
-            "A daily manhunt runs right here in #💬-general-chat. Cops get poetic intel drops on the hour; "
+            "A daily manhunt runs right here in #🌍-everyone-chat. Cops get poetic intel drops on the hour; "
             "robbers just have to survive, or strike first. Nobody knows who's been drafted until the DM "
-            "arrives. `/chase-status` to check in, `/leave-chase` if you'd rather sit one out."
+            "arrives. `/chase` to check in, `/chase leave` if you'd rather sit one out."
         ),
         inline=False
     )
@@ -2995,7 +3035,7 @@ async def announce_version_handoff(guild):
             name="🕵️ ONGOING INVESTIGATION — THE OLD UNIT DIDN'T GO QUIETLY",
             value=(
                 "Word from Internal Affairs: the retired instance is still out there, hiding among you under "
-                "a false identity, occasionally running its mouth right here in #💬-general-chat. "
+                "a false identity, occasionally running its mouth right here in #🌍-everyone-chat. "
                 "`/catch <name>` the moment you think you've made them."
             ),
             inline=False
@@ -3027,7 +3067,7 @@ async def announce_version_handoff(guild):
         if started:
             await log_event(guild, "🕵️ **ROGUE ROBOCOP ROUND STARTED** — triggered by this version handoff.")
     else:
-        await log_event(guild, "ℹ️ **ROGUE ROBOCOP SKIPPED** — the program is currently toggled off for this server (`/toggle-rogue-bot-program`).")
+        await log_event(guild, "ℹ️ **ROGUE ROBOCOP SKIPPED** — the program is currently toggled off for this server (`/settings rogue_bot_program`).")
 
 
 async def restore_lockdown_state(guild):
@@ -3072,7 +3112,7 @@ async def gather_all_community_channels(guild) -> list:
     alliance's own lobby — the 'everyone' scope shared by staff-tier
     /announce and the automatic version-handoff broadcast."""
     targets = []
-    general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+    general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
     if general_ch:
         targets.append(general_ch)
     for num in await get_managed_servers(guild.id):
@@ -3589,13 +3629,13 @@ async def check_critical_security(guild):
     # else. Checked and force-corrected every startup, the same way
     # Millie's color is — nobody has to remember to fix this by hand.
     # Talking is optional; being there is not.
-    general_chat_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+    general_chat_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
     if general_chat_ch and member_role:
         current_overwrite = general_chat_ch.overwrites_for(member_role)
         if current_overwrite.view_channel is not True:
             try:
                 await general_chat_ch.set_permissions(member_role, overwrite=discord.PermissionOverwrite(view_channel=True))
-                repairs.append("💬 **#💬-general-chat** wasn't guaranteed-visible to Member — restored. Everyone with Member stays there, always; nobody has to talk.")
+                repairs.append("💬 **#🌍-everyone-chat** wasn't guaranteed-visible to Member — restored. Everyone with Member stays there, always; nobody has to talk.")
             except discord.Forbidden:
                 pass
 
@@ -4090,7 +4130,7 @@ async def finalize_registration_from_nickname(guild, member, name: str, tag: str
     try:
         await member.send(
             f"✅ Your registration in **{guild.name}** was completed by staff based on your existing nickname. Welcome aboard, officially!\n\n"
-            + await tf(NAME_CHANGE_REMINDER, member.id, abilities=abilities_mention(guild))
+            + await tf(NAME_CHANGE_REMINDER, member.id)
         )
     except discord.Forbidden:
         pass
@@ -4504,19 +4544,17 @@ ABILITY_BLOCKS = {
         "header": "🧑‍✈️ **Chief Privileges**",
         "lines": [
             "🎮 `/rps [opponent]` — Rock, Paper, Scissors vs another Chief or me.",
-            "🏆 `/alliance-leaderboard` — see alliance member-count rankings.",
-            "📨 `/request-rank` (in #⚙️-role-requests) — petition for R4/R5 rank in your alliance, or ask your R5 to trust you with `/grant-leadership` directly.",
-            "🌐 React with 🌐 on any message for a private DM translation.",
-            "🗣️ `/language` — change which language I use when talking to you, any time.",
-            "🕐 `/timezone` — set your approximate time zone so I can tell you how the server's schedule lines up with yours.",
-            "📇 `/nickname` — if your in-game name is different on each server you play, manage them here.",
-            "✏️ `/change-nick` — quick one-step update if your in-game name changed (or you just typo'd it) — keeps your `[TAG] (servers)` tag intact.",
-            "🛠️ `/fix-me` — registered with the wrong name, tag, or server? Buttons to fix any of them yourself — or one to summon a human.",
-            "🕵️ `/chase-status`, `/leave-chase`, `/join-chase` — Cops & Robbers runs daily at noon, check #💬-general-chat.",
+            "📊 `/stats` — your record and rank. Add `top10`, `monthly`, `games` or `alliances` for the other boards.",
+            "🕵️ `/chase` — Cops & Robbers runs daily at noon in #🌍-everyone-chat: check your status, or `leave` / `join` future rounds.",
+            "🚔 `/arrest <name>` / `/ambush <name>` — your moves in Cops & Robbers, if you're in the round.",
             "🤖 `/catch <name>` — if a Rogue RoboCop is ever hiding among you, this is how you catch it.",
-            "📊 `/game-stats` — running server-wide totals for RPS, Cops & Robbers, and Rogue RoboCop (also auto-posted daily).",
-            "📅 `/monthly-standings` — see this month's gold/silver/bronze race so far (auto-announced and reset on the 1st).",
+            "📨 `/request-rank` (in #⚙️-role-requests) — petition for R4/R5 in your alliance.",
+            "🛠️ `/fix-me` — wrong name, tag or server on file? Fix it yourself, or summon a human.",
+            "🗣️ `/language` and 🕐 `/timezone` — which language I talk to you in, and your rough time zone.",
+            "🌐 React with 🌐 on any message for a private DM translation.",
+            "🛡️ `/safety` — proof I'm legit: my public code, what I keep about you, and what I'll never ask for.",
             "📢 `/announce <message>` — post to the current channel, once per hour.",
+            "❓ `/help` — this list, any time.",
         ],
     },
     "R4": {
@@ -4528,26 +4566,25 @@ ABILITY_BLOCKS = {
         "lines": [
             "🔑 Full command of your alliance's leadership chat and roster.",
             "⚖️ You can approve or deny R4 requests within your own alliance directly from #logs — no staff needed.",
+            "🎖️ `/leadership grant|revoke <member>` — trust someone with leadership-chat access without changing their rank.",
             "📢 `/announce <message>` — reaches every channel in your alliance at once, once per 30 minutes.",
-            "🏷️ `/rename-tag <old> <new>` — rename your own alliance's tag; updates its roles, channels, and every member's record at once.",
+            "🏷️ `/alliance rename` — rename your own alliance's tag; updates its roles, channels, and every member's record at once.",
         ],
     },
     "JUDGE": {
         "header": "🔨 **JUDGE Privileges** — you're a moderator now, don't let it go to your head",
         "lines": [
+            "⚠️ `/warn <member> <reason>` — a formal warning, kept on their record.",
             "🔨 `/imprison <nickname> <minutes>` — lock someone in solitary.",
-            "🚪 `/unban <user_id>` and `/pardon <user_id>`.",
-            "⚠️ `/warn <member> <reason>` and `/warnings <member>`.",
-            "🔓 `/approve-tag <tag>` — release a new alliance from the Drunk Tank.",
+            "🕊️ `/pardon <member or id>` — release from prison/time-out, clear strikes, and lift a ban if there is one.",
+            "📂 `/record <member>` — their full file: registration, warnings, moderation history.",
+            "🔎 `/lookup` — banned users, who holds a role, everyone by tag/server/rank, or usage stats.",
+            "🔓 `/alliance approve <tag>` — release a new alliance from the Drunk Tank.",
+            "🕹️ `/game start|end|restart` — control Cops & Robbers and Rogue RoboCop (asks before it acts).",
+            "📅 `/monthly-champions-now` — announce the Monthly Champion now and reset standings.",
             "🚨 `/killswitch [minutes] [off]` — emergency chat lockdown.",
-            "📋 `/show-banned`, `/show-role`, `/show-db-fields`, `/show-field`, `/re-check-nicknames`.",
-            "📢 `/announce <message>` — as staff, this reaches the entire server, no cooldown.",
-            "📊 `/server-stats` — translations, referrals, RPS records, and more.",
-            "🕵️ `/start-chase` / `/end-chase` — manually trigger or cut short a Cops & Robbers round.",
-            "🕹️ `/game-start`, `/game-end`, `/game-restart` — unified control for Cops & Robbers AND Rogue RoboCop: start now or in N minutes, end now or pause-and-auto-resume in N minutes, or restart on the spot.",
-            "📅 `/monthly-champions-now` — manually trigger the Monthly Champion announcement and reset standings, without waiting for the 1st.",
-            "🏷️ `/rename-tag <old> <new>` — rename ANY alliance's tag (not just your own), same as staff.",
-            "📝 `/enforce-registration <member>` — flag an existing member for mandatory registration.",
+            "🧰 `/admin-tools re-check-nicknames` / `enforce-registration` — nickname audit; make one member register.",
+            "📢 `/announce <message>` — as staff, reaches the entire server, no cooldown.",
             "↩️ Undo / Release Now buttons on every #logs entry.",
         ],
     },
@@ -4555,17 +4592,19 @@ ABILITY_BLOCKS = {
         "header": "🟠 **SENATOR Privileges** — everything a Judge has, plus the keys to the walls",
         "lines": [
             "🏗️ Create and delete channels directly in Discord.",
-            "🔒 `/stop-alliance <lock>` — freeze new alliance creation server-wide.",
-            "⏱️ `/release-timekeeper` — open a 10-minute alliance-creation burst window.",
-            "🛠️ `/add-request-role <role> <description>`.",
-            "🌟 `/toggle-innovator-program` — turn future automatic Innovator badge grants on or off.",
-            "🏆 `/set-monthly-prize <prize>` — set what next month's Monthly Champion (Gold) actually wins. Defaults to bragging rights.",
-            "🧹 `/dissolve-alliance <tag>` — delete a typo-alliance completely (roles, channels, records). Confirms first.",
+            "🎖️ `/grant-rank` — give someone R4 or R5 directly (leave `member` blank for a searchable picker).",
+            "🔒 `/alliance lock|unlock|burst|dissolve` — freeze or allow new alliances, open a 10-minute burst window, or delete a typo-alliance.",
+            "⚙️ `/settings` — every live setting in one place: chase hours, supported servers, Innovator and Rogue programs, the monthly prize. Blank value = just look.",
+            "🛠️ `/admin-tools add-request-role` — add a role to the request menu.",
         ],
     },
     "DICTATOR": {
         "header": "👑 **DICTATOR Privileges** — everything, always, no exceptions",
-        "lines": ["🌐 Full Administrator. Every command, every switch, every door."],
+        "lines": [
+            "🌐 Full Administrator. Every command, every switch, every door.",
+            "🌟 `/innovators grant-everyone|restore` — bulk badge grants.",
+            "🧰 `/admin-tools` — server adoption, legacy-role migration, bulk onboarding, the database panel, the update announcement.",
+        ],
     },
 }
 
@@ -4575,7 +4614,7 @@ def compute_capabilities(member) -> list:
     A true Discord Administrator always gets DICTATOR-level display, even
     without literally holding the DICTATOR role — matching how
     is_staff_member()/is_dictator_member() already treat raw Administrator
-    permission as equivalent, so /abilities can't disagree with what the
+    permission as equivalent, so /help can't disagree with what the
     permission checks actually allow."""
     names = {r.name for r in member.roles}
     caps = []
@@ -4632,7 +4671,7 @@ def rank_color(capabilities) -> discord.Color:
 
 def build_abilities_embed(member: discord.Member, capabilities, title: str, description: str = "") -> discord.Embed:
     """Shared pretty embed used by the onboarding welcome DM, clearance-upgrade
-    DM, and /abilities — one badge/thumbnail/color-coded 'personnel file' look
+    DM, and /help — one badge/thumbnail/color-coded 'personnel file' look
     across all three."""
     embed = discord.Embed(title=title, description=description, color=rank_color(capabilities), timestamp=datetime.now())
     embed.set_thumbnail(url=member.display_avatar.url)
@@ -4688,33 +4727,24 @@ def _chunk_lines_for_field(lines, limit: int = EMBED_FIELD_VALUE_LIMIT) -> list:
 #  If a command's gating decorator ever changes, update its entry here too.
 # ------------------------------------------------------------
 COMMAND_TIER = {
-    "unban": "Judge+", "pardon": "Judge+", "re-check-nicknames": "Judge+", "imprison": "Judge+",
-    "approve-tag": "Judge+", "killswitch": "Judge+", "warn": "Judge+", "warnings": "Judge+",
-    "server-stats": "Judge+", "show-banned": "Judge+", "show-role": "Judge+", "show-db-fields": "Judge+",
-    "show-field": "Judge+", "start-chase": "Judge+", "end-chase": "Judge+", "game-start": "Judge+",
-    "game-end": "Judge+", "game-restart": "Judge+", "enforce-registration": "Judge+", "robocop": "Judge+",
-    "add-request-role": "Senator+", "configure-setting": "Senator+", "toggle-innovator-program": "Senator+",
-    "toggle-rogue-bot-program": "Senator+", "stop-alliance": "Senator+", "release-timekeeper": "Senator+",
-    "configure-servers": "Senator+", "grant-rank": "Senator+", "grant-rank-picker": "Senator+",
-    "set-monthly-prize": "Senator+", "dissolve-alliance": "Senator+",
-    "announce-update": "Dictator", "bulk-onboard-existing": "Dictator", "ptd-reset": "Dictator",
-    "ptd-upgrade-now": "Dictator", "adopt-alliance": "Dictator", "migrate-legacy-roles": "Dictator",
-    "grant-innovator-all": "Dictator", "restore-innovators": "Dictator", "database-tools": "Dictator",
+    "pardon": "Judge+", "imprison": "Judge+", "killswitch": "Judge+", "warn": "Judge+", "record": "Judge+",
+    "lookup": "Judge+", "game": "Judge+", "monthly-champions-now": "Judge+",
+    "alliance": "R5 of that tag, or Judge+",   # approve/lock/dissolve are gated per option inside
+    "admin-tools": "Judge+",                    # per-option: Judge+ / Senator+ / Dictator
+    "grant-rank": "Senator+", "settings": "Senator+",
+    "innovators": "Dictator",
     "rename-tag": "R5 of that tag, or Judge+",
-    "game-stats": "Everyone", "monthly-standings": "Everyone",
-    "monthly-champions-now": "Judge+",
 }
-# Commands that LOOK open to everyone by decorator, but actually carry an
-# internal-only restriction the decorator can't express — flagged so the
-# public reference doesn't accidentally undersell what they require.
+# Commands whose options carry different rank requirements, or an internal
+# restriction a decorator can't express — flagged so the public reference
+# doesn't undersell what they require.
 COMMAND_SPECIAL_NOTES = {
-    "approve-tag": "For a second alliance with the same tag from another server, type the tag and server, e.g. `HAL-121`.",
-    "dissolve-alliance": "For a second alliance with the same tag from another server, type the tag and server, e.g. `HAL-121`.",
-    "grant-rank": "For a second alliance with the same tag from another server, type the tag and server, e.g. `HAL-121`.",
-    "rename-tag": "Renaming ONTO an existing tag merges the two alliances — admin only (Dictator or Discord Administrator).",
+    "alliance": "rename: the alliance's own R5 or Judge+. approve: Judge+. dissolve/lock/unlock/burst: Senator+. Same tag on two servers? Type e.g. `HAL-121`.",
+    "admin-tools": "re-check-nicknames and enforce-registration: Judge+. add-request-role: Senator+. Everything else: Dictator.",
+    "grant-rank": "Same tag on two servers? Type the tag and server, e.g. `HAL-121`.",
     "announce": "Scope depends on rank: Member reaches the current channel (1/hr), an alliance R5 reaches all of that alliance's channels (1/30min), staff reach the whole server (no limit).",
-    "grant-leadership": "R5-only — enforced internally, not by a Discord permission.",
-    "revoke-leadership": "R5-only — enforced internally, not by a Discord permission.",
+    "leadership": "R5-only — enforced internally, not by a Discord permission.",
+    "safety": "Anyone can read it. Staff can add `post_here: True` to post and pin it for everyone.",
 }
 COMMAND_TIER_ORDER = ["Everyone", "R5 of that tag, or Judge+", "Judge+", "Senator+", "Dictator"]
 COMMAND_TIER_HEADERS = {
@@ -4726,16 +4756,30 @@ COMMAND_TIER_HEADERS = {
 }
 
 
-def build_public_command_reference(verbose: bool) -> list:
+def build_public_command_reference(verbose: bool, for_member=None) -> list:
     """Returns a list of message-sized text chunks (each safely under
     Discord's 2000-char limit) listing every registered command, grouped by
     tier. verbose=False is a name + one-liner per command; verbose=True adds
     every parameter's own name/description/required-ness."""
     by_tier = {tier: [] for tier in COMMAND_TIER_ORDER}
+    # for_member: only list what this person can actually run.
+    allowed = set(COMMAND_TIER_ORDER)
+    if isinstance(for_member, discord.Member):
+        allowed = {"Everyone"}
+        if any(r.name.endswith("-R5") for r in for_member.roles) or is_staff_member(for_member):
+            allowed.add("R5 of that tag, or Judge+")
+        if is_staff_member(for_member):
+            allowed.add("Judge+")
+        if is_senior_staff_member(for_member):
+            allowed.add("Senator+")
+        if is_dictator_member(for_member):
+            allowed.add("Dictator")
     for cmd in sorted(bot.tree.get_commands(), key=lambda c: c.name):
         tier = COMMAND_TIER.get(cmd.name, "Everyone")
         if tier not in by_tier:
             tier = "Everyone"  # guard: an unknown tier label must never crash the whole reference
+        if tier not in allowed:
+            continue
         line = f"`/{cmd.name}` — {cmd.description}"
         note = COMMAND_SPECIAL_NOTES.get(cmd.name)
         if note:
@@ -4764,6 +4808,18 @@ def build_public_command_reference(verbose: bool) -> list:
     return chunks
 
 
+async def send_command_reference_dm(member: discord.Member, header: str):
+    """DMs the verbose command list, filtered to what THIS member can run,
+    in their language. Used by the welcome DM and every clearance-upgrade
+    DM, so the list a person holds is always the one for their current rank."""
+    chunks = build_public_command_reference(verbose=True, for_member=member)
+    if not chunks:
+        return
+    chunks[0] = header + "\n" + chunks[0]
+    for chunk in chunks:
+        await send_long(member, await t(chunk, member.id))  # translations can run long
+
+
 async def sync_abilities_channel_reference(guild, abilities_ch):
     """Keeps a pinned, always-current SIMPLE command list at the top of
     #❓-abilities — this is deliberately what greets anyone opening the
@@ -4775,7 +4831,7 @@ async def sync_abilities_channel_reference(guild, abilities_ch):
     chunk count changed since last time."""
     settings_key = f"abilities_simple_msg_ids_{guild.id}"
     chunks = build_public_command_reference(verbose=False)
-    intro = "🤖 **Type `/abilities` any time for YOUR personal rundown.** Below is the full server-wide command list.\n"
+    intro = "🤖 **Type `/help` any time for YOUR personal rundown.** Below is the full server-wide command list — every option is explained as you type.\n"
     chunks = [intro + chunks[0]] + chunks[1:]
 
     stored_raw = await get_setting(settings_key)
@@ -4941,6 +4997,8 @@ async def restore_persistent_views():
     bot.add_view(DatabaseToolsView())  # same idea — persists the release/reset panel across restarts
     bot.add_view(BulkAutoRegisterView())  # same idea — persists the startup-diagnostic bulk button
     bot.add_view(AbilitiesReferenceView())  # persists the #❓-abilities "Show Full Verbose List" button
+    bot.add_view(SettingsPanelView())  # persists the #⚙️-settings buttons
+    bot.add_view(ChaseRosterView())  # persists every "Count me in" button (announcements, settings, invite DMs)
 
     cutoff = (datetime.now() - timedelta(days=14)).isoformat()
     async with db_connect() as conn:
@@ -5122,6 +5180,27 @@ ONBOARDING_CHECKIN_SECONDS = 120
 # all come back with it).
 ASK_WHO_INVITED = False
 
+PUBLIC_CODE_URL = "https://github.com/Mesk62/robocop"
+
+# The short "you're not being scammed" note — shown in onboarding and by
+# /safety. The full itemised list (PRIVACY_NOTE, below) comes with /safety.
+SAFETY_NOTE = (
+    "🛡️ **I'm RoboCop, this server's official bot — and you're safe here.**\n"
+    "🔍 **Nothing to hide:** my code is public. Anyone can read it: <{url}>\n"
+    "✅ **All I ever need:** your in-game name, alliance tag, game server number and language "
+    "(plus a rough time zone, only if you want to share it).\n"
+    "🚫 **I will NEVER ask for:** passwords, login codes, account emails, or payment. Anyone asking for those — "
+    "even if they look like me — is a crook. Report them to a Judge! 👮\n"
+    "📋 Type `/safety` any time for the full list of what I keep."
+)
+
+# The two-line version newcomers see mid-onboarding (the full SAFETY_NOTE
+# and PRIVACY_NOTE are one `/safety` away).
+SAFETY_NOTE_SHORT = (
+    "🛡️ I'm the official bot here, and my code is public: <{url}>\n"
+    "🚫 I will **never** ask for passwords, login codes or payment. Type `/safety` any time for details."
+)
+
 PRIVACY_NOTE = (
     "🔒 **Privacy, straight talk.** Here's *everything* I keep about you:\n"
     "• **What you tell me:** your in-game name (one per game server, if they differ), alliance tag, "
@@ -5133,7 +5212,9 @@ PRIVACY_NOTE = (
     "• **Moderation history, if any:** warnings, time-outs, kicks or bans and the reason given — and, if you "
     "ever land in jail, the roles you had so I can hand them back when you're released.\n\n"
     "Also good to know: posts in #🐛-bugs and #💡-suggestions are copied to the staff log, and when you ask "
-    "me to translate a message (🌐), its text is sent to Google Translate to do it — nothing is saved. I notice "
+    "me to translate a message (🌐), its text is sent to Google Translate to do it — nothing is saved. When you "
+    "first register I look up words that rhyme with your in-game name (Datamuse, a free dictionary service — just "
+    "the name is sent) for your welcome rhyme. I notice "
     "when you come online so I can send the odd stats reminder, but I don't record it.\n\n"
     "**What I never collect:** no real name, address, phone number, email, location or payment details, "
     "and I don't save your chat messages. Just a robot with a very short notepad. 🤖📝"
@@ -5208,13 +5289,12 @@ async def send_onboarding_checkin(member):
 
 
 async def send_onboarding_countdown_dm(member, warning_text: str, seconds_left: int, add_help_hint: bool):
-    onboard_console(member, f"⏰ DM warning sent — about {seconds_left}s left before removal")
+    onboard_console(member, f"⏰ DM nudge sent — about {seconds_left}s left before this step pauses")
     hint = " Confused? Just type `help` in #gateway." if add_help_hint else ""
     try:
         await member.send(await t(
-            f"⏰ {warning_text} You have about {seconds_left} seconds left to respond in #gateway, or you'll be "
-            f"removed from the server. No worries if that happens — you can rejoin any time and pick up right "
-            f"where you left off.{hint}",
+            f"⏰ {warning_text} About {seconds_left} seconds left on this question in #gateway. If you're busy, no "
+            f"problem at all — I'll just pause, and any message in #gateway later picks up exactly where you left off.{hint}",
             member.id
         ))
     except discord.Forbidden:
@@ -5375,7 +5455,7 @@ async def park_for_alliance_cooldown(guild, member, gateway_channel, tag: str, c
     ts = int(cooldown_ends.timestamp())
     onboard_console(member, f"⏳ new alliance [{tag}] must wait {mins} min (cooldown) — auto-resume at {cooldown_ends:%H:%M}")
     await log_event(guild, f"⏳ **ALLIANCE CREATION WAITING**\nUser: {member.mention} | Tag: [{tag}]\n"
-                           f"Cooldown ends <t:{ts}:t> — I'll resume them automatically. `/release-timekeeper` lets them in sooner.")
+                           f"Cooldown ends <t:{ts}:t> — I'll resume them automatically. `/alliance burst` lets them in sooner.")
     await gateway_channel.send(await tf(
         "⏳ {mention}, new alliances roll off the line one at a time, and one was just registered — so **[{tag}]** "
         "can be created at <t:{ts}:t> (<t:{ts}:R>). You don't need to do anything: stay here and I'll ping you "
@@ -5383,7 +5463,7 @@ async def park_for_alliance_cooldown(guild, member, gateway_channel, tag: str, c
         member.id, mention=member.mention, tag=tag, ts=str(ts)))
     await notify_staff_dm(guild, "⏳ New alliance waiting on the cooldown",
                           f"{member.mention} wants to create **[{tag}]**. The {ALLIANCE_CREATION_COOLDOWN_MINUTES}-minute "
-                          f"cooldown ends <t:{ts}:t>; they'll be picked up automatically. Run `/release-timekeeper` "
+                          f"cooldown ends <t:{ts}:t>; they'll be picked up automatically. Run `/alliance burst` "
                           f"if you'd like to let them in now (then they can use `/register`).",
                           color=discord.Color.orange())
     old = _resume_tasks.pop(member.id, None)
@@ -5538,6 +5618,99 @@ async def view_wait_with_warning(member, view, total_timeout: float, warning_tex
     if timed_out:
         onboard_console(member, "⌛ timed out without clicking")
     return not timed_out
+
+
+# ------------------------------------------------------------
+#  #⚙️-settings (10.0) — one place that explains everything a member can
+#  personalise, with a button for each so nobody has to remember a command.
+#  The buttons are persistent (static custom_ids, registered at startup).
+# ------------------------------------------------------------
+CH_SETTINGS = "⚙️-settings"
+CH_SETTINGS_NOTICE = (
+    "⚙️ **YOUR SETTINGS — everything you can personalise, in one place.**\n"
+    "Click a button below (only you see the reply), or type the command any time, anywhere.\n\n"
+    "🌍 **Language** — I talk to *you* in your language: menus, DMs, onboarding, the lot. Missed it when you joined? Set it here. (`/language`)\n"
+    "🕐 **Time zone** — optional. Tell me roughly where you are and I'll translate the daily schedule (Cops & Robbers at noon, etc.) into your time. (`/timezone`)\n"
+    "🪪 **Name, tag, server** — your nickname here is `Name [TAG] (server)`. Changed your in-game name, moved alliance, or typo'd it? Fix it yourself, no staff needed. (`/fix-me`)\n"
+    "📇 **Different names on different servers** — play on two game servers with two names? Store both and pick which one shows. (`/fix-me nicknames`)\n"
+    "🕵️ **Cops & Robbers** — the daily manhunt is **opt-in**: you're only drafted (or DMed) if you join the roster. In or out, any time. (`/chase join` / `/chase leave`)\n"
+    "🌐 **Translate anything** — react with 🌐 on any message and I'll DM you a translation. Nothing to set up.\n"
+    "🛡️ **What I keep about you** — the full, honest list, and what I'll never ask for. (`/safety`)\n"
+    "❓ **Everything you can do** — your personal rundown, updated as you gain roles. (`/help`)"
+)
+
+
+class SettingsPanelView(discord.ui.View):
+    """The buttons under the pinned #⚙️-settings notice. Each one opens the
+    same private menu the matching slash command does."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        return not await busy_reject_component(interaction)
+
+    @discord.ui.button(label="Language", style=discord.ButtonStyle.primary, emoji="🌍", custom_id="rc_settings_language")
+    async def language(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await language_cmd(interaction)
+
+    @discord.ui.button(label="Time zone", style=discord.ButtonStyle.primary, emoji="🕐", custom_id="rc_settings_timezone")
+    async def timezone(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await timezone_cmd(interaction)
+
+    @discord.ui.button(label="Name / tag / server", style=discord.ButtonStyle.secondary, emoji="🪪", custom_id="rc_settings_fixme")
+    async def fixme(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await fix_me_cmd(interaction)
+
+    @discord.ui.button(label="Names per server", style=discord.ButtonStyle.secondary, emoji="📇", custom_id="rc_settings_nicknames")
+    async def nicknames(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await nickname_cmd(interaction)
+
+    @discord.ui.button(label="Cops & Robbers: in or out", style=discord.ButtonStyle.secondary, emoji="🕵️", custom_id="rc_settings_chase")
+    async def chase(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._guard(interaction):
+            return
+        on = await chase_is_opted_in(interaction.user.id)
+        n = await chase_roster_size(interaction.guild)
+        await interaction.response.send_message(
+            f"🕵️ **Cops & Robbers** is opt-in — you only get drafted (and DMed) if you're on the roster.\n"
+            f"You're currently **{'ON' if on else 'NOT on'}** the roster. {n} signed up; the daily round needs {CHASE_MIN_PARTICIPANTS}.",
+            view=ChaseRosterView(), ephemeral=True)
+
+
+async def ensure_pinned_notice(guild, channel, settings_key: str, content: str, view=None):
+    """Keeps ONE pinned bot message at the top of a channel current: edits it
+    in place across restarts, reposts + re-pins only if it was deleted."""
+    key = f"{settings_key}_{guild.id}"
+    stored = await get_setting(key)
+    msg = None
+    if stored:
+        try:
+            msg = await channel.fetch_message(int(stored))
+        except (discord.NotFound, discord.HTTPException, ValueError):
+            msg = None
+    if msg:
+        if msg.content != content or view is not None:
+            try:
+                await msg.edit(content=content, view=view)
+            except discord.HTTPException:
+                pass
+        return msg
+    try:
+        msg = await channel.send(content, view=view)
+        try:
+            await msg.pin()
+        except discord.HTTPException:
+            pass
+        await set_setting(key, str(msg.id))
+        return msg
+    except discord.HTTPException as e:
+        print(f"[WARNING] Couldn't post the pinned notice in #{channel.name}: {e}")
+        return None
 
 
 async def build_global_infrastructure(guild):
@@ -5757,20 +5930,37 @@ async def build_global_infrastructure(guild):
     except Exception as e:
         print(f"[ERROR] Failed to sync #❓-abilities command reference: {e}")
 
+    # ⚙️ The settings channel — everything a member can personalise, with buttons.
+    settings_ch = discord.utils.get(guild.channels, name=CH_SETTINGS)
+    if not settings_ch:
+        st_overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        settings_ch = await guild.create_text_channel(CH_SETTINGS, category=roles_cat, overwrites=st_overwrites, topic="Everything you can personalise — language, time zone, your name and tag, games. Click a button.")
+        repairs.append(f"⚙️ Channel **#{CH_SETTINGS}** didn't exist — created it and pinned the settings guide.")
+    try:
+        await ensure_pinned_notice(guild, settings_ch, "settings_notice_msg_id", CH_SETTINGS_NOTICE, view=SettingsPanelView())
+    except Exception as e:
+        print(f"[ERROR] Failed to sync #{CH_SETTINGS}: {e}")
+
     main_text_cat = discord.utils.get(guild.categories, name="🏢 MAIN PRECINCT")
     if not main_text_cat:
         main_text_cat = await guild.create_category("🏢 MAIN PRECINCT")
         repairs.append("🗄️ Category **🏢 MAIN PRECINCT** didn't exist — recreated it.")
 
-    # ↩️ Reverting the earlier landing-zone experiment: if a previous run
-    # already renamed #💬-general-chat to #🛬-landing-zone, rename it back
-    # and restore its original unlocked permissions.
-    renamed_back = discord.utils.get(guild.channels, name="🛬-landing-zone")
-    if renamed_back and not discord.utils.get(guild.channels, name="💬-general-chat"):
+    # 🌍 THE chat for everyone — its own category, pinned to the top, and a
+    #    name/topic that says exactly what it is. Older servers get their
+    #    💬-general-chat (or the even older 🛬-landing-zone) renamed in
+    #    place, so nothing is lost.
+    everyone_cat = discord.utils.get(guild.categories, name=CAT_EVERYONE)
+    if not everyone_cat:
+        everyone_cat = await guild.create_category(CAT_EVERYONE, position=0)
+        repairs.append(f"🌍 Category **{CAT_EVERYONE}** didn't exist — created it at the very top.")
+    elif everyone_cat.position != 0:
         try:
-            await renamed_back.edit(name="💬-general-chat")
-            repairs.append("↩️ Reverted **#🛬-landing-zone** back to **#💬-general-chat**, unlocked, as originally intended.")
-        except discord.Forbidden:
+            await everyone_cat.edit(position=0)
+        except discord.HTTPException:
             pass
 
     gen_overwrites = {
@@ -5780,17 +5970,32 @@ async def build_global_infrastructure(guild):
         prison_role: discord.PermissionOverwrite(view_channel=False),
         to_role: discord.PermissionOverwrite(view_channel=False)
     }
-    general_chat_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+    general_chat_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
     if not general_chat_ch:
-        general_chat_ch = await guild.create_text_channel("💬-general-chat", category=main_text_cat, overwrites=gen_overwrites)
-        repairs.append("💬 Channel **#💬-general-chat** didn't exist — recreated it.")
+        legacy = discord.utils.get(guild.channels, name=CH_EVERYONE_LEGACY) or discord.utils.get(guild.channels, name="🛬-landing-zone")
+        if legacy:
+            try:
+                await legacy.edit(name=CH_EVERYONE, reason="10.0: the chat for everyone gets a name that says so.")
+                general_chat_ch = legacy
+                repairs.append(f"🌍 Renamed **#{legacy.name}** to **#{CH_EVERYONE}** (same channel, history kept).")
+            except discord.Forbidden:
+                pass
+    if not general_chat_ch:
+        general_chat_ch = await guild.create_text_channel(CH_EVERYONE, category=everyone_cat, overwrites=gen_overwrites)
+        repairs.append(f"🌍 Channel **#{CH_EVERYONE}** didn't exist — created it.")
     else:
         # In case it got locked by the reverted feature, restore the simple
         # original overwrite (view-only was never the intent here).
         member_ow = general_chat_ch.overwrites_for(member_role)
         if member_ow.send_messages is False:
             await general_chat_ch.set_permissions(member_role, overwrite=discord.PermissionOverwrite(view_channel=True))
-            repairs.append("↩️ **#💬-general-chat** was locked down by the reverted feature — restored normal chat access.")
+            repairs.append(f"↩️ **#{CH_EVERYONE}** was locked down by the reverted feature — restored normal chat access.")
+    try:
+        if general_chat_ch.category != everyone_cat or general_chat_ch.topic != CH_EVERYONE_TOPIC:
+            await general_chat_ch.edit(category=everyone_cat, topic=CH_EVERYONE_TOPIC, position=0)
+    except discord.HTTPException as e:
+        print(f"[WARNING] Couldn't move/describe #{CH_EVERYONE}: {e}")
+    await ensure_pinned_notice(guild, general_chat_ch, "everyone_notice_msg_id", CH_EVERYONE_NOTICE)
 
     # 🌟 Innovator-only lounge — visible to badge holders plus staff, a
     # dedicated space for suggestions and issues away from general chat.
@@ -5817,8 +6022,8 @@ async def build_global_infrastructure(guild):
                     "Every day at noon, this server runs a secret game: some of you become **cops**, some "
                     "become **robbers** — nobody knows who's who, not even each other's side. Cops get "
                     "poetic clues every hour; robbers just have to survive six hours, or strike first.\n\n"
-                    "You'll get a DM if you're picked. Not interested? `/leave-chase` opts you out any time. "
-                    "Curious how you're doing? `/chase-status`.\n\n"
+                    "You'll get a DM if you're picked. Not interested? `/chase leave` opts you out any time. "
+                    "Curious how you're doing? `/chase`.\n\n"
                     "That's it — no spoilers here. Just keep an eye on this channel."
                 ),
                 color=discord.Color.dark_purple()
@@ -6084,9 +6289,9 @@ class TagConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="No problem. Let's try that again.", view=None)
         self.stop()
 
-    @discord.ui.button(label="Whoops? I don't even know how I got here?", style=discord.ButtonStyle.danger)
-    async def trap(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.result = "trap"
+    @discord.ui.button(label="I'm confused — get me a human", style=discord.ButtonStyle.danger, emoji="🆘")
+    async def need_help(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.result = "help"
         await interaction.response.edit_message(content="Initiating 60-second emergency cool-off...", view=None)
         self.stop()
 
@@ -6479,10 +6684,10 @@ class BulkAutoRegisterView(discord.ui.View):
                     title="🚔 You're officially registered",
                     description=(
                         f"This server just got upgraded, and you've been carried over as **[{tag}]**, server "
-                        f"**{srv_display}**. Run `/abilities` any time for a full rundown, and if you actually play "
+                        f"**{srv_display}**. Run `/help` any time for a full rundown, and if you actually play "
                         f"on more than just server {srv_display}, head to "
                         f"{role_req_ch.mention if role_req_ch else '#⚙️-role-requests'} to add any others. "
-                        f"If your name isn't quite right, `/nickname` fixes that any time."
+                        f"If your name isn't quite right, `/fix-me nicknames` fixes that any time."
                     ),
                     color=discord.Color.blue()
                 ))
@@ -7085,8 +7290,15 @@ async def on_ready():
                 await report_translation_failure(guild, translation_detail)
 
     if is_takeover:
+        # (10.0) Announce (and lock chat for a minute, and start a Rogue round)
+        # only when the VERSION changed. Restarting the same version — a
+        # config tweak, a hiccup, a second deploy attempt — stays quiet.
         for guild in bot.guilds:
+            if await get_guild_setting(guild.id, "announced_version") == ROBOCOP_VERSION:
+                await log_event(guild, f"🔄 Instance handoff (same version {ROBOCOP_VERSION}) — no announcement, no lockdown, no Rogue round.")
+                continue
             await announce_version_handoff(guild)
+            await set_guild_setting(guild.id, "announced_version", ROBOCOP_VERSION)
 
     for guild in bot.guilds:
         log_channel = discord.utils.get(guild.channels, name="logs")
@@ -7110,11 +7322,12 @@ async def on_ready():
             repairs = await safe_step(guild, "build infrastructure", build_global_infrastructure(guild), default=[]) or []
             bot.infra_ready_guilds.add(guild.id)
             await safe_step(guild, "resume Cops & Robbers round", reschedule_active_chase_round(guild))
+            await safe_step(guild, "chase roster migration", migrate_chase_roster_once(guild))
             await safe_step(guild, "resume chase recruit DMs", reschedule_pending_chase_recruits(guild))
             bot.loop.create_task(daily_chase_scheduler(guild))
             bot.loop.create_task(chase_leaderboard_syndication_loop(guild))
             bot.loop.create_task(daily_nickname_maintenance_scheduler(guild))
-            bot.loop.create_task(daily_game_stats_scheduler(guild))
+            bot.loop.create_task(weekly_precinct_report_scheduler(guild))
             await safe_step(guild, "seed monthly baseline", ensure_monthly_baseline_seeded(guild))
             bot.loop.create_task(monthly_champion_scheduler(guild))
             await safe_step(guild, "resume Rogue RoboCop round", reschedule_active_rogue_round(guild))
@@ -7195,11 +7408,12 @@ async def on_guild_join(guild):
     await safe_step(guild, "resume alliance approval timers", reschedule_pending_alliance_approvals(guild))
     await safe_step(guild, "restore lockdown state", restore_lockdown_state(guild))
     await safe_step(guild, "resume Cops & Robbers round", reschedule_active_chase_round(guild))
+    await safe_step(guild, "chase roster migration", migrate_chase_roster_once(guild))
     await safe_step(guild, "resume chase recruit DMs", reschedule_pending_chase_recruits(guild))
     bot.loop.create_task(daily_chase_scheduler(guild))
     bot.loop.create_task(chase_leaderboard_syndication_loop(guild))
     bot.loop.create_task(daily_nickname_maintenance_scheduler(guild))
-    bot.loop.create_task(daily_game_stats_scheduler(guild))
+    bot.loop.create_task(weekly_precinct_report_scheduler(guild))
     await safe_step(guild, "seed monthly baseline", ensure_monthly_baseline_seeded(guild))
     bot.loop.create_task(monthly_champion_scheduler(guild))
     await safe_step(guild, "resume Rogue RoboCop round", reschedule_active_rogue_round(guild))
@@ -7643,6 +7857,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             description=pick_flavor(UPGRADE_FLAVOR, "upgrade")
         )
         await after.send(embed=upgrade_embed)
+        # ...and the full, current command list for their NEW level, every
+        # option explained — so a fresh Judge never has to go looking.
+        await send_command_reference_dm(after, header="📖 **Your full command list now reads:**")
     except discord.Forbidden:
         pass  # DMs closed — nothing to do
     except discord.HTTPException as e:
@@ -7700,7 +7917,7 @@ async def on_message(message):
         await forward_feedback_message(message)
         return
 
-    if not message.channel.name == "💬-general-chat":
+    if not message.channel.name == CH_EVERYONE:
         return
     if not _is_leader:
         return
@@ -7721,10 +7938,20 @@ async def on_message(message):
     _rogue_last_comment_at = now_ts
     _, secret_name, _ = active
     identity = next((i for i in ROGUE_BOT_IDENTITIES if i["name"] == secret_name), None)
-    if identity and identity["hints"] and random.random() < 0.5:
-        line = random.choice(identity["hints"])
-    else:
-        line = random.choice(ROGUE_BOT_FILLER_LINES)
+    roll = random.random()
+    line = None
+    if roll < 0.35:
+        # (10.0) The Rogue is a poet now: a rhyme on whoever just spoke,
+        # built the same way as the arrival rhymes (Datamuse words, our lines).
+        speaker = strip_nickname_decorations(message.author.display_name) or message.author.name
+        rhymes = await fetch_rhymes(speaker)
+        if rhymes:
+            line = pick_flavor(ROGUE_RHYME_TEMPLATES, "rogue_rhyme").format(name=speaker, rhyme=random.choice(rhymes))
+    if line is None:
+        if identity and identity["hints"] and roll < 0.7:
+            line = random.choice(identity["hints"])
+        else:
+            line = random.choice(ROGUE_BOT_FILLER_LINES)
 
     try:
         await message.channel.send(line)
@@ -7756,26 +7983,10 @@ async def _handle_presence_update(before: discord.Member, after: discord.Member)
     if before.status != discord.Status.offline or after.status == discord.Status.offline:
         return  # only a genuine offline -> online-ish transition counts
 
-    # Everyone (not just staff) gets a light stats reminder on login,
-    # cooldown-gated so it's not obnoxious for people who flicker
-    # online/offline a lot.
+    # (10.0) No more "welcome back, here are your stats" DM on every login —
+    # an unasked-for DM is exactly the kind of thing that makes people mute
+    # a bot. /stats is one command away for anyone who wants it.
     now_ts = time.monotonic()
-    last_stats = _last_stats_reminder.get(after.id, 0)
-    if now_ts - last_stats >= STATS_REMINDER_COOLDOWN_HOURS * 3600:
-        _last_stats_reminder[after.id] = now_ts
-        async with db_connect() as conn:
-            cur = await conn.cursor()
-            await cur.execute("SELECT rps_wins, rogue_catches FROM user_stats WHERE user_id = ?", (after.id,))
-            us = await cur.fetchone()
-        rps_wins, rogue_catches = us if us else (0, 0)
-        try:
-            await after.send(
-                f"📊 Welcome back, {after.display_name}! Quick stats check: **{rps_wins}** RPS win(s), "
-                f"**{rogue_catches}** Rogue RoboCop catch(es). Run `/stats` any time for the full picture, "
-                f"or `/leaderboard` to see where everyone stands."
-            )
-        except discord.Forbidden:
-            pass
 
     # If this person happens to be in the top 10 overall, give the server
     # a fun heads-up in #general-chat that they're online — separately and
@@ -7786,7 +7997,7 @@ async def _handle_presence_update(before: discord.Member, after: discord.Member)
         top_ids = {uid for uid, _, _ in leaderboard[:10]}
         if after.id in top_ids:
             _last_top10_celebration[after.id] = now_ts
-            general_ch = discord.utils.get(after.guild.channels, name="💬-general-chat")
+            general_ch = discord.utils.get(after.guild.channels, name=CH_EVERYONE)
             if general_ch:
                 opener = random.choice(TOP10_ARRIVAL_OPENERS)
                 descriptor = random.choice(TOP10_ARRIVAL_DESCRIPTORS).format(mention=after.mention)
@@ -7824,6 +8035,77 @@ async def _handle_presence_update(before: discord.Member, after: discord.Member)
         await after.send(embed=embed)
     except discord.Forbidden:
         pass
+
+
+# ------------------------------------------------------------
+#  ARRIVAL RHYME (10.0) — every newly registered Chief gets welcomed into
+#  🌍-everyone-chat with a two-line rhyme on their name. The rhymes are
+#  RoboCop's own: the ONLY thing fetched from outside is a list of words
+#  that rhyme with the name (Datamuse — a free dictionary service, no key,
+#  and only the name is sent). No song lyrics, ever. If the name won't
+#  rhyme (or Datamuse is down), a rhyme-free welcome goes out instead.
+# ------------------------------------------------------------
+DATAMUSE_RHYME_URL = "https://api.datamuse.com/words"
+_rhyme_cache = {}
+
+ARRIVAL_RHYME_TEMPLATES = [
+    "🚔 Sirens on, dispatch, we've got a new **{name}** —\nthe donuts are counted, so nobody {rhyme}!",
+    "📻 *Crackle* — all units, meet Chief **{name}**,\nbadge freshly polished, and ready to {rhyme}.",
+    "🎉 Roll out the tape, here comes **{name}** —\nevery server and alliance, give a cheer and a {rhyme}!",
+    "🤖 *Beep boop* — hello, **{name}**, you made it inside;\nthe coffee's gone cold but the {rhyme} is worldwide.",
+    "🚨 Breaking news from the precinct: **{name}** is here —\nword on the beat says the {rhyme} is near.",
+    "👮 Sworn in and suited, Chief **{name}** reports —\nbring your best {rhyme}, we accept all sorts.",
+]
+ARRIVAL_PLAIN_TEMPLATES = [
+    "🚔 Sirens on, dispatch — Chief **{name}** just walked in. Every server, every alliance: say hello!",
+    "📻 *Crackle* — all units, please welcome **{name}** to the precinct. Be nice, they're new.",
+    "🎉 Roll out the tape: **{name}** is on the beat. Give them a wave!",
+]
+
+
+async def fetch_rhymes(word: str) -> list:
+    """Words that rhyme with `word` (or its last chunk), best first. Cached
+    per process; returns [] on any hiccup — the welcome never waits on it."""
+    key = re.sub(r"[^a-z]", "", (word or "").lower())
+    if len(key) < 2:
+        return []
+    if key in _rhyme_cache:
+        return _rhyme_cache[key]
+    rhymes = []
+    try:
+        session = await get_http_session()
+        async with session.get(DATAMUSE_RHYME_URL, params={"rel_rhy": key, "max": 40}, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                rhymes = [d["word"] for d in data if " " not in d.get("word", "") and 3 <= len(d["word"]) <= 10 and d["word"].isalpha()]
+        if not rhymes and len(key) > 4:  # try the tail of a long/unusual name
+            async with session.get(DATAMUSE_RHYME_URL, params={"rel_rhy": key[-4:], "max": 40}, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    rhymes = [d["word"] for d in data if " " not in d.get("word", "") and 3 <= len(d["word"]) <= 10 and d["word"].isalpha()]
+    except (asyncio.TimeoutError, aiohttp.ClientError, KeyError, TypeError, ValueError):
+        rhymes = []
+    _rhyme_cache[key] = rhymes[:15]
+    return _rhyme_cache[key]
+
+
+async def build_arrival_line(name: str) -> str:
+    rhymes = await fetch_rhymes(name)
+    if rhymes:
+        return pick_flavor(ARRIVAL_RHYME_TEMPLATES, "arrival_rhyme").format(name=name, rhyme=random.choice(rhymes))
+    return pick_flavor(ARRIVAL_PLAIN_TEMPLATES, "arrival_plain").format(name=name)
+
+
+async def post_arrival_welcome(guild, member, in_game_name: str):
+    """The public hello in 🌍-everyone-chat once someone finishes registering."""
+    ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
+    if not ch:
+        return
+    try:
+        line = await build_arrival_line(in_game_name)
+        await ch.send(f"{line}\n👋 {member.mention}")
+    except discord.HTTPException as e:
+        await report_error(guild, "arrival welcome in everyone-chat", member, e)
 
 
 async def handle_member_join(member):
@@ -7936,13 +8218,12 @@ async def handle_member_join(member):
     # --- PHASE 0: LANGUAGE SELECTION (always first, skipped if already chosen) ---
     language_already_selected = bool(reg_row and reg_row[4])
     if not language_already_selected:
-        onboard_console(member, "step 1/6: choosing a language")
+        onboard_console(member, "step 1/4: choosing a language")
         lang_view = LanguageView(member, timeout=LANGUAGE_DEFAULT_SECONDS)
         lang_msg = await gateway_channel.send(
-            f"{member.mention} 🌍 **Please select your language** / Por favor selecciona tu idioma / Veuillez choisir votre langue / "
-            "Bitte wählen Sie Ihre Sprache / Пожалуйста, выберите язык / الرجاء اختيار لغتك / कृपया अपनी भाषा चुनें\n"
-            "*(English, Russian, German, Spanish, French, Arabic, Hindi — plus a few more in the list below.)*\n"
-            f"*No choice in {LANGUAGE_DEFAULT_SECONDS} seconds? No problem — I'll carry on in English.*",
+            f"👋 {member.mention} — four quick questions and you're in.\n"
+            "🌍 **1. Your language** · Tu idioma · Ta langue · Deine Sprache · Ваш язык · لغتك · आपकी भाषा\n"
+            f"*(No pick in {LANGUAGE_DEFAULT_SECONDS} seconds = English. Change it later with `/language`.)*",
             view=lang_view
         )
         timed_out = await lang_view.wait()
@@ -7967,55 +8248,33 @@ async def handle_member_join(member):
             await cursor.execute("UPDATE users SET language_selected = 1 WHERE user_id = ?", (member.id,))
             await conn.commit()
 
-    # --- PRIVACY NOTE — right after language, so it arrives in their language ---
+    # --- SAFETY NOTE — right after language, so it arrives in their language.
+    #     Short on purpose: who I am, the public code link, what I'll never ask
+    #     for. The full itemised privacy list lives in /safety. ---
     try:
-        await send_long(gateway_channel, f"{member.mention} " + await t(PRIVACY_NOTE, member.id))  # translations can run long — split safely
+        await send_long(gateway_channel, f"{member.mention} " + await tf(SAFETY_NOTE_SHORT, member.id, url=PUBLIC_CODE_URL))  # translations can run long — split safely
     except discord.HTTPException:
         pass
 
-    # --- PHASE 0.25: TIME ZONE PREFERENCE (optional, informational — never blocks or kicks) ---
-    async with db_connect() as conn:
-        cursor = await conn.cursor()
-        await cursor.execute("SELECT pref_timezone FROM users WHERE user_id = ?", (member.id,))
-        tz_row = await cursor.fetchone()
-    if not (tz_row and tz_row[0]):
-        onboard_console(member, "step 2/6: time zone (optional)")
-        tz_view = TimezoneView(member)
-        await gateway_channel.send(
-            member.mention + " " + await tf(
-                "🕐 One more optional thing — what time zone are you roughly in? This server runs on a fixed "
-                "schedule (things like the daily Cops & Robbers round), so this just helps me tell you how that "
-                "lines up with your own time. Totally skippable if you'd rather not say.",
-                member.id
-            ),
-            view=tz_view
-        )
-        await tz_view.wait()  # no kick on timeout — this is a nice-to-know, not a checkpoint
+    # (Time zone is no longer an onboarding step — it's optional, so it's
+    #  offered once in the welcome DM and always available via /timezone.)
 
     # --- PHASE 0.5: TEST SERVER DISCLAIMER (mandatory, once) ---
     disclaimer_ack = bool(reg_row and reg_row[6])
     if not disclaimer_ack:
-        onboard_console(member, "step 3/6: test-server notice")
+        onboard_console(member, "test-server notice")
         disclaimer_view = TestServerDisclaimerView(member)
         await gateway_channel.send(
             content=await tf(
-                "⚠️ **BEFORE WE GO ANY FURTHER, {mention}** — this is a **test server**. We're actively "
-                "building and breaking things here, which means **everything could be wiped at any point "
-                "between now and 7 days from today** — your registration, your alliance, your messages, all "
-                "of it. That's not a threat, just the honest deal.\n\n"
-                "🙏 Thank you for being one of our testers — genuinely, it helps a lot. Click below to "
-                "confirm you understand, and let's get you set up.",
+                "⚠️ {mention}, quick heads-up: this is a **test server** — things here (including your registration) "
+                "could be wiped while we build. Thanks for testing with us! Click ✅ to carry on.",
                 member.id, mention=member.mention
             ),
             view=disclaimer_view
         )
-        resolved = await view_wait_with_warning(member, disclaimer_view, 240.0, "Still there to confirm you understand?")
+        resolved = await view_wait_with_warning(member, disclaimer_view, 240.0, "Still there to click ✅?")
         if not resolved:
-            try:
-                await member.kick(reason="Never acknowledged the test-server disclaimer during onboarding.")
-                await log_mod_action(guild, "kick", member.id, member.display_name, "Robocop (Automated)", "Never responded to the test-server disclaimer.")
-            except discord.HTTPException:
-                pass
+            await announce_onboarding_pause(member, gateway_channel)  # (10.0) silence pauses; it never kicks
             return
 
         async with db_connect() as conn:
@@ -8107,8 +8366,8 @@ async def handle_member_join(member):
     # --- PHASE 2: IDENTITY ---
     in_game_name = reg_row[0] if reg_row and reg_row[0] else None
     if not in_game_name:
-        onboard_console(member, "step 4/6: in-game name")
-        await gateway_channel.send(await tf("{mention}, what is your exact in-game username?", member.id, mention=member.mention))
+        onboard_console(member, "step 2/4: in-game name")
+        await gateway_channel.send(await tf("🪪 {mention}, **2. What's your exact in-game name?** (Just type it.)", member.id, mention=member.mention))
         try:
             name_msg = await wait_with_warning(member, check, 240.0, "Still working on your username?")
             in_game_name = name_msg.content.strip()
@@ -8117,46 +8376,49 @@ async def handle_member_join(member):
                 cursor = await conn.cursor()
                 await cursor.execute("UPDATE users SET in_game_name = ? WHERE user_id = ?", (in_game_name, member.id))
                 await conn.commit()
-            try:
-                await gateway_channel.send(await tf(NAME_CHANGE_REMINDER, member.id, abilities=abilities_mention(member.guild)))
-            except discord.HTTPException:
-                pass
+            # (10.0) The name-change reminder moved into the welcome DM — one
+            # less message to read mid-registration.
         except asyncio.TimeoutError:
             await announce_onboarding_pause(member, gateway_channel)
             return
 
     # --- PHASE 3: ALLIANCE TAG & ASSIGNMENT ---
+    server_from_tag_step = []  # filled if they answer "PTD 21" — saves asking question 4
     tag_input = reg_row[1] if reg_row and reg_row[1] else None
     if not tag_input:
-        onboard_console(member, "step 5/6: alliance tag")
+        onboard_console(member, "step 3/4: alliance tag")
+        managed_for_tag = await get_managed_servers(guild.id)
         tag_strikes = 0
         while True:
-            await gateway_channel.send(await tf("{mention} Understood, {name}. Now, enter your **Alliance Tag** (2 to 4 letters strictly).", member.id, mention=member.mention, name=in_game_name))
+            await gateway_channel.send(await tf(
+                "🏷️ Thanks, {name}! **3. Your alliance tag** — the 2–4 letters next to your alliance's name in the game (e.g. `PTD`).\n"
+                "*Tip: add your server number too, like `PTD 21`, and that's question 4 done as well.*",
+                member.id, name=in_game_name))
             try:
                 tag_msg = await wait_with_warning(member, check, 240.0, "Still working on your alliance tag?")
-                tag_input = tag_msg.content.strip().upper()
-                onboard_console(member, f"   tag entered: {tag_input[:20]}")
+                raw_tag_answer = tag_msg.content.strip()
+                # "PTD 21", "PTD, 21", "[PTD] (21)" — the first word is the tag, any
+                # numbers after it that match a real server answer question 4 early.
+                words = re.findall(r"[A-Za-z]+|\d+", raw_tag_answer)
+                tag_input = (words[0] if words else raw_tag_answer).upper()
+                server_from_tag_step = normalize_server_input(" ".join(w for w in words[1:] if w.isdigit()), managed_for_tag)
+                onboard_console(member, f"   tag entered: {tag_input[:20]}" + (f" (server {'/'.join(server_from_tag_step)} given too)" if server_from_tag_step else ""))
 
                 if 2 <= len(tag_input) <= 4 and tag_input.isalpha():
                     view = TagConfirmView(member, tag_input)
-                    await gateway_channel.send(await tf("⚠️ {mention}, you entered **[{tag}]**. Please double-check this.", member.id, mention=member.mention, tag=tag_input), view=view)
+                    await gateway_channel.send(await tf("👀 {mention}, that's **[{tag}]** — correct?", member.id, mention=member.mention, tag=tag_input), view=view)
                     resolved = await view_wait_with_warning(member, view, 240.0, "Still there to confirm your tag?")
                     if not resolved:
-                        try:
-                            await member.kick(reason="Never confirmed alliance tag during onboarding.")
-                            await log_mod_action(guild, "kick", member.id, member.display_name, "Robocop (Automated)", "Never responded to the tag-confirmation prompt.")
-                        except discord.HTTPException:
-                            pass
+                        await announce_onboarding_pause(member, gateway_channel)  # (10.0) silence pauses; it never kicks
                         return
 
                     if view.result == "retry":
                         continue
-                    elif view.result == "trap":
-                        try:
-                            await member.timeout(timedelta(seconds=60), reason="Trap door button.")
-                        except discord.HTTPException:
-                            pass
-                        return
+                    elif view.result == "help":
+                        # (10.0) The old "trap door" button timed people out for
+                        # being confused. Now it does the obvious thing: gets a human.
+                        await escalate_onboarding_help(member, gateway_channel)
+                        continue
                     elif view.result == "confirm":
                         chosen = await choose_alliance_key(guild, member, gateway_channel, tag_input)
                         if chosen is None:
@@ -8170,8 +8432,7 @@ async def handle_member_join(member):
                     tag_strikes += 1
                     if tag_strikes < 3:
                         await gateway_channel.send(await tf(
-                            "⚠️ {mention} That doesn't look like an alliance tag — it's the **2 to 4 letters** shown next "
-                            "to your alliance's name in the game (letters only, e.g. `PTD`). Try again, or type `help`.",
+                            "⚠️ {mention}, a tag is **2 to 4 letters only** (e.g. `PTD`). Try again, or type `help`.",
                             member.id, mention=member.mention
                         ))
                     else:
@@ -8212,7 +8473,7 @@ async def handle_member_join(member):
                         "🔒 {mention}, new alliances are paused by staff right now, so I can't create **[{tag}]** yet. "
                         "I've let them know you're waiting — hang tight, you're not in trouble.",
                         member.id, mention=member.mention, tag=tag_input))
-                    await notify_staff_dm(guild, "🔒 Someone's waiting to create an alliance", f"{member.mention} wants to create **[{tag_input}]** but alliance creation is locked (`/stop-alliance`). They're parked in #gateway.", color=discord.Color.orange())
+                    await notify_staff_dm(guild, "🔒 Someone's waiting to create an alliance", f"{member.mention} wants to create **[{tag_input}]** but alliance creation is locked (`/alliance unlock`). They're parked in #gateway.", color=discord.Color.orange())
                     return
 
                 await cursor.execute("SELECT tag FROM alliances WHERE creator_id = ?", (member.id,))
@@ -8398,12 +8659,23 @@ async def handle_member_join(member):
                     await log_event(guild, f"⚠️ **CHANNEL GENERATION FAILED** for [{tag_input}]: `{e}`")
 
     # --- PHASE 4: SERVER AUTH & FINALIZATION ---
-    onboard_console(member, "step 6/6: server number")
+    onboard_console(member, "step 4/4: server number")
     async with db_connect() as conn:
         cursor = await conn.cursor()
         await cursor.execute("SELECT server_number FROM users WHERE user_id = ?", (member.id,))
         srv_row = await cursor.fetchone()
     server_nums = await parse_stored_server_field(srv_row[0], guild.id) if srv_row and srv_row[0] else []
+
+    # They may have answered this already alongside their tag ("PTD 21").
+    if not server_nums and server_from_tag_step:
+        server_nums = server_from_tag_step
+        async with db_connect() as conn:
+            cursor = await conn.cursor()
+            await cursor.execute("UPDATE users SET server_number = ? WHERE user_id = ?", (",".join(server_nums), member.id))
+            await conn.commit()
+        for num in server_nums:
+            await upsert_user_nickname(member.id, num, in_game_name, make_active=(num == server_nums[0]))
+        onboard_console(member, f"   server taken from the tag answer: {'/'.join(server_nums)}")
 
     if not server_nums:
         managed_servers = await get_managed_servers(guild.id)
@@ -8411,8 +8683,8 @@ async def handle_member_join(member):
         server_strikes = 0
         while server_strikes < 3:
             await gateway_channel.send(await t(
-                f"{member.mention}, what server are you from? Enter one or more of: {server_list_display} "
-                f"(comma-separated if more than one), or `all`.",
+                f"🗺️ {member.mention}, **4. Last one — which game server?** One of: {server_list_display} "
+                f"(more than one? separate with commas, or type `all`).",
                 member.id
             ))
             try:
@@ -8460,9 +8732,7 @@ async def handle_member_join(member):
                             for num in server_nums:
                                 await upsert_user_nickname(member.id, num, in_game_name, make_active=(num == server_nums[0]))
                             await gateway_channel.send(await tf(
-                                "📇 Quick heads up: since you're playing on multiple servers, your in-game name might "
-                                "not be the same on all of them. I've saved **{name}** for now — if it's different on "
-                                "one of your other servers, you can manage separate nicknames any time with `/nickname`.",
+                                "📇 Saved **{name}** for all your servers. Different name on one of them? `/fix-me` sorts it any time.",
                                 member.id, name=in_game_name
                             ))
                     else:
@@ -8514,6 +8784,8 @@ async def handle_member_join(member):
         if srv_role:
             await member.add_roles(srv_role)
 
+    await post_arrival_welcome(guild, member, trimmed_name)
+
     onboard_embed = discord.Embed(
         title="✅ NEW CHIEF ONBOARDED",
         color=discord.Color.green(),
@@ -8546,17 +8818,16 @@ async def handle_member_join(member):
             description=pick_flavor(WELCOME_FLAVOR, "welcome")
         )
         where_to_find_info = await t(
-            f"👉 **Head to {abilities_ch.mention if abilities_ch else '#❓-abilities'} to see exactly what you're "
-            f"cleared to do here.** It's got the full list, pinned right at the top.\n\n"
-            f"A few other things worth knowing:\n"
-            f"• Something wrong with your name, tag, or server? `/fix-me` — buttons for each, no staff needed.\n"
-            f"• `/stats` any time — your record and rank across RPS, Rogue RoboCop, and Cops & Robbers.\n"
-            f"• React 🌐 on any message for a private translation into your language.\n"
-            f"• Keep an eye on #💬-general-chat around noon — something interesting happens there daily.",
+            f"• `/help` — everything you can do here, any time.\n"
+            "• " + await tf(NAME_CHANGE_REMINDER, member.id) + "\n"
+            f"• **#⚙️-settings** — language, time zone, your name and tag: everything you can personalise, with buttons.\n"
+            f"• React 🌐 on any message for a private translation.\n"
+            f"• **#🌍-everyone-chat** is where everyone from every server hangs out. Fancy a daily game of Cops & Robbers? It's opt-in — join the roster in #⚙️-settings. 🚔",
             member.id
         )
-        welcome_embed.add_field(name="📍 Where To Find Things", value=where_to_find_info, inline=False)
+        welcome_embed.add_field(name="📍 Where To Find Things", value=where_to_find_info[:1024], inline=False)
         await member.send(embed=welcome_embed)
+        await send_command_reference_dm(member, header="📖 **Every command you can use right now** (each option is explained as you type it):")
         await mark_capabilities_notified(member.id, caps)
     except discord.Forbidden:
         pass
@@ -8573,15 +8844,83 @@ async def handle_member_join(member):
 #  COPS & ROBBERS — game engine
 # ============================================================
 async def get_eligible_chase_pool(guild) -> list:
-    """Everyone currently holding Member, minus anyone who's opted out."""
+    """10.0: OPT-IN. Only members who said "count me in" (roster in
+    chase_opt_ins) get drafted — nobody is DMed about a game they never
+    asked to play. Must still hold Member."""
     member_role = discord.utils.get(guild.roles, name=ROLE_MEMBER)
     if not member_role:
         return []
     async with db_connect() as conn:
         cur = await conn.cursor()
+        await cur.execute("SELECT user_id FROM chase_opt_ins")
+        roster = {row[0] for row in await cur.fetchall()}
+    return [m for m in member_role.members if not m.bot and m.id in roster]
+
+
+async def chase_roster_size(guild) -> int:
+    return len(await get_eligible_chase_pool(guild))
+
+
+async def chase_set_opt_in(user_id: int, opted_in: bool):
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        if opted_in:
+            await cur.execute("INSERT OR IGNORE INTO chase_opt_ins (user_id) VALUES (?)", (user_id,))
+            await cur.execute("DELETE FROM chase_opt_outs WHERE user_id = ?", (user_id,))
+        else:
+            await cur.execute("DELETE FROM chase_opt_ins WHERE user_id = ?", (user_id,))
+            await cur.execute("INSERT OR IGNORE INTO chase_opt_outs (user_id) VALUES (?)", (user_id,))
+        await conn.commit()
+
+
+async def chase_is_opted_in(user_id: int) -> bool:
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        await cur.execute("SELECT 1 FROM chase_opt_ins WHERE user_id = ?", (user_id,))
+        return (await cur.fetchone()) is not None
+
+
+async def migrate_chase_roster_once(guild):
+    """One-time (per guild): anyone who has actually made a move in a past
+    round is clearly a player — put them on the opt-in roster so the game
+    doesn't go dark the day this ships. Everyone else joins when they want."""
+    if await get_guild_setting(guild.id, "chase_roster_migrated") == "1":
+        return
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        await cur.execute("SELECT DISTINCT user_id FROM chase_participants WHERE participated = 1")
+        players = [r[0] for r in await cur.fetchall()]
         await cur.execute("SELECT user_id FROM chase_opt_outs")
-        opted_out = {row[0] for row in await cur.fetchall()}
-    return [m for m in member_role.members if not m.bot and m.id not in opted_out]
+        outs = {r[0] for r in await cur.fetchall()}
+        for uid in players:
+            if uid not in outs:
+                await cur.execute("INSERT OR IGNORE INTO chase_opt_ins (user_id) VALUES (?)", (uid,))
+        await conn.commit()
+    await set_guild_setting(guild.id, "chase_roster_migrated", "1")
+    await log_event(guild, f"🕵️ **COPS & ROBBERS IS NOW OPT-IN** — {len([p for p in players if p not in outs])} past player(s) moved onto the roster automatically. "
+                           f"Everyone else joins with the button in #🌍-everyone-chat, #⚙️-settings, or `/chase join`. Nobody gets game DMs unless they're on the roster.")
+
+
+class ChaseRosterView(discord.ui.View):
+    """'Count me in' / 'Not for me' — persistent, so it works on the daily
+    announcement, in #⚙️-settings and in the one-time invite DM."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Count me in", style=discord.ButtonStyle.success, emoji="🚔", custom_id="rc_chase_optin")
+    async def opt_in(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await busy_reject_component(interaction):
+            return
+        await chase_set_opt_in(interaction.user.id, True)
+        await interaction.response.send_message(
+            "🚔 You're on the roster! You'll get a DM when you're drafted into a round (cop or robber — it's secret). "
+            "Changed your mind? `/chase leave` any time.", ephemeral=True)
+
+    @discord.ui.button(label="Not for me", style=discord.ButtonStyle.secondary, emoji="🙅", custom_id="rc_chase_optout")
+    async def opt_out(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await chase_set_opt_in(interaction.user.id, False)
+        await interaction.response.send_message("👍 No problem — you won't be drafted or DMed about Cops & Robbers. `/chase join` if you ever change your mind.", ephemeral=True)
 
 
 async def get_active_chase_round(guild):
@@ -8636,13 +8975,13 @@ def compute_guess_score(guess_text: str, tag: str, servers: list, base_name: str
 async def start_chase_round(guild, started_by: str) -> tuple:
     """Returns (success: bool, message: str)."""
     if await get_active_chase_round(guild):
-        return False, "A chase is already underway — end it first with `/end-chase`."
+        return False, "A chase is already underway — end it first with `/game end`."
     if server_is_busy():
         return False, f"🔧 RoboCop is busy ({_busy['reason']}) — no new chases until the garage door's back up. Try again in a few minutes."
 
-    general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+    general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
     if not general_ch:
-        return False, "Couldn't find #💬-general-chat — run infrastructure setup first."
+        return False, "Couldn't find #🌍-everyone-chat — run infrastructure setup first."
 
     pool = await get_eligible_chase_pool(guild)
     if len(pool) < CHASE_MIN_PARTICIPANTS:
@@ -8679,9 +9018,10 @@ async def start_chase_round(guild, started_by: str) -> tuple:
                 title="🚔 YOU'VE BEEN DEPUTIZED",
                 description=(
                     "You're a **cop** in this round's Cops & Robbers. Somewhere in this server, robbers are "
-                    "hiding in plain sight. Every hour, I'll DM you a poetic clue narrowing down who's still "
-                    "at large — use `/arrest <name>` to make your move. Guess close and I'll tell you you're "
-                    "warm, even if you miss.\n\nTell no one. Good luck, Chief."
+                    "hiding in plain sight. Every hour a poetic clue narrows down who's still at large — in the "
+                    "**cops-only thread** under #🌍-everyone-chat (you've been added; confer with your fellow cops there). "
+                    "Use `/arrest <name>` to make your move. Guess close and I'll tell you you're warm, even if you miss."
+                    "\n\nTell no one. Good luck, Chief."
                 ),
                 color=discord.Color.blue()
             ))
@@ -8709,19 +9049,87 @@ async def start_chase_round(guild, started_by: str) -> tuple:
             "knows who's who — not even each other's side.\n\n"
             f"The round runs for **{round_hours} hours**. Clues drop hourly, in secret, to the cops "
             "alone. When it ends, everything gets revealed.\n\n"
-            "You won't know if you're playing until you get a DM. Good luck out there."
+            "You won't know if you're playing until you get a DM. Good luck out there.\n\n"
+            "*Not on the roster yet? Hit the button to be in the next one.*"
         ),
         color=discord.Color.red(),
         timestamp=datetime.now()
-    ))
+    ), view=ChaseRosterView())
+    # 🚔 A private thread for the cops: clues land there (one post, not one
+    #    DM per cop per hour) and the cops can confer. Falls back to DMs if
+    #    the server can't make private threads.
+    cop_thread = await create_cop_thread(guild, general_ch, round_id, cops, round_hours)
+
     async with db_connect() as conn:
         cur = await conn.cursor()
-        await cur.execute("UPDATE chase_rounds SET announcement_msg_id = ? WHERE round_id = ?", (announcement_msg.id, round_id))
+        await cur.execute("UPDATE chase_rounds SET announcement_msg_id = ?, cop_thread_id = ? WHERE round_id = ?",
+                          (announcement_msg.id, cop_thread.id if cop_thread else None, round_id))
         await conn.commit()
 
     await log_event(guild, f"🚨 **CHASE STARTED**\nBy: {started_by}\nCops: {len(cops)} | Robbers: {len(robbers)}\nEnds: {ends_at.strftime('%Y-%m-%d %H:%M')}")
     bot.loop.create_task(run_chase_round_timers(guild, round_id))
     return True, f"🚨 Chase started — {len(cops)} cop(s), {len(robbers)} robber(s). Ends in {round_hours} hours."
+
+
+async def create_cop_thread(guild, general_ch, round_id: int, cops: list, round_hours: int):
+    """Private thread in everyone-chat for this round's cops. Returns the
+    thread, or None if Discord won't allow one here (then clues go by DM)."""
+    try:
+        thread = await general_ch.create_thread(
+            name=f"🚔 cops-only · round {round_id}",
+            type=discord.ChannelType.private_thread,
+            invitable=False,
+            auto_archive_duration=1440,
+            reason="Cops & Robbers — cops' clue room for this round",
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"[CHASE] Couldn't create the cops' thread ({type(e).__name__}: {e}) — clues will go by DM.")
+        return None
+    for m in cops:
+        try:
+            await thread.add_user(m)
+        except discord.HTTPException:
+            pass
+    try:
+        await thread.send(
+            f"🚔 **Cops-only.** {len(cops)} of you, {round_hours} hours, and the robbers don't know you're here.\n"
+            "Clues drop in this thread every hour. Compare notes, split the suspects, then `/arrest <name>` (works from anywhere). "
+            "Warm guesses get a 🔥; cold ones a ❄️. Robbers can `/ambush` you back, so don't get cocky."
+        )
+    except discord.HTTPException:
+        pass
+    return thread
+
+
+async def close_cop_thread(guild, round_id: int, farewell, delete: bool = False):
+    thread = await get_cop_thread(guild, round_id)
+    if thread is None:
+        return
+    try:
+        if delete:
+            await thread.delete()
+            return
+        if farewell:
+            await thread.send(farewell)
+        await thread.edit(archived=True, locked=True)
+    except discord.HTTPException:
+        pass
+
+
+async def get_cop_thread(guild, round_id: int):
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        await cur.execute("SELECT cop_thread_id FROM chase_rounds WHERE round_id = ?", (round_id,))
+        row = await cur.fetchone()
+    if not row or not row[0]:
+        return None
+    thread = guild.get_thread(row[0])
+    if thread is None:
+        try:
+            thread = await guild.fetch_channel(row[0])
+        except discord.HTTPException:
+            return None
+    return thread
 
 
 async def send_chase_hints(guild, round_id: int, tier: int):
@@ -8755,6 +9163,13 @@ async def send_chase_hints(guild, round_id: int, tier: int):
     )
     embed.set_footer(text="Use /arrest <name> to make your move.")
 
+    thread = await get_cop_thread(guild, round_id)
+    if thread is not None:
+        try:
+            await thread.send(embed=embed)
+            return
+        except discord.HTTPException as e:
+            print(f"[CHASE] Cops' thread post failed ({e}) — falling back to DMs for this hour.")
     for cop_id in cops:
         cop = guild.get_member(cop_id)
         if cop:
@@ -8777,7 +9192,7 @@ async def post_chase_leaderboard(guild):
     if not (top_cops or top_robbers or top_ambushers):
         return
 
-    general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+    general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
     if not general_ch:
         return
 
@@ -8818,10 +9233,10 @@ async def end_chase_round(guild, round_id: int, reason: str):
                 )
             elif role == "cop":
                 if not eliminated:
-                    # a cop "wins" by landing at least one arrest during the round
-                    await cur.execute("SELECT arrests_made FROM chase_stats WHERE user_id = ?", (user_id,))
-                    arrests_row = await cur.fetchone()
-                    if arrests_row and arrests_row[0] > 0:
+                    # a cop "wins" by landing at least one arrest THIS round
+                    # (was: lifetime arrests — one old collar won every round forever).
+                    await cur.execute("SELECT COUNT(*) FROM chase_participants WHERE round_id = ? AND role = 'robber' AND eliminated = 1 AND eliminated_by = ?", (round_id, user_id))
+                    if (await cur.fetchone())[0] > 0:
                         await cur.execute("UPDATE chase_stats SET cop_wins = cop_wins + 1 WHERE user_id = ?", (user_id,))
             elif role == "robber":
                 if not eliminated:
@@ -8836,7 +9251,7 @@ async def end_chase_round(guild, round_id: int, reason: str):
         await cur.execute("UPDATE chase_rounds SET status = 'ended' WHERE round_id = ?", (round_id,))
         await conn.commit()
 
-    general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+    general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
     if general_ch:
         survivors = sum(1 for _, role, elim, part in participants if role == "robber" and part and not elim)
         embed = discord.Embed(
@@ -8859,6 +9274,7 @@ async def end_chase_round(guild, round_id: int, reason: str):
             pass
 
     await log_event(guild, f"🎬 **CHASE ENDED** (round #{round_id})\nReason: {reason}")
+    await close_cop_thread(guild, round_id, "🎬 Round over — case closed. This thread archives itself now.")
 
 
 async def void_chase_round(guild, round_id: int):
@@ -8879,7 +9295,7 @@ async def void_chase_round(guild, round_id: int):
 
     msg_id = row[0] if row else None
     if msg_id:
-        general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+        general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
         if general_ch:
             try:
                 old_msg = await general_ch.fetch_message(msg_id)
@@ -8888,6 +9304,7 @@ async def void_chase_round(guild, round_id: int):
                 pass
 
     await log_event(guild, f"🗑️ **CHASE VOIDED** (round #{round_id}) — nobody made a move in 30 minutes. No stats recorded, announcement removed.")
+    await close_cop_thread(guild, round_id, None, delete=True)
 
 
 async def run_chase_round_timers(guild, round_id: int):
@@ -8998,7 +9415,7 @@ async def end_rogue_bot_round(guild, round_id: int, escaped: bool, caught_by: in
         row = await cur.fetchone()
         secret_name = row[0] if row else "???"
 
-    general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+    general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
     if general_ch:
         if escaped:
             embed = discord.Embed(
@@ -9177,35 +9594,88 @@ async def build_game_stats_embed(guild) -> discord.Embed:
         value=f"**{rogue_rounds_played}** round(s) completed — 🎉 Caught: **{rogue_caught}** | 🏃 Got away: **{rogue_escaped}**",
         inline=False
     )
-    embed.set_footer(text="Voided rounds (nobody played) aren't counted here. Run /game-stats any time for the latest.")
+    embed.set_footer(text="Voided rounds (nobody played) aren't counted here. Run /stats games any time for the latest.")
     return embed
 
 
-async def daily_game_stats_scheduler(guild):
-    """Posts the same embed /game-stats builds to #general-chat once a day,
-    at the configured hour (default midnight, local server time) — a
-    passive digest on top of the on-demand command, same scheduling
-    pattern as daily_chase_scheduler and the nickname maintenance job."""
+async def build_precinct_report_embed(guild) -> discord.Embed:
+    """One post a week: what actually happened around here. Reads only
+    what the bot already stores (see README) plus Discord's own join dates."""
+    since = datetime.now() - timedelta(days=7)
+    since_iso = since.isoformat()
+    since_utc = since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        await cur.execute("SELECT COUNT(*) FROM chase_rounds WHERE status = 'ended' AND (started_at >= ? OR started_at >= ?)", (since_iso, since_utc))
+        chases = (await cur.fetchone())[0]
+        await cur.execute("SELECT COUNT(*) FROM rogue_bot_rounds WHERE status = 'ended' AND caught_by IS NOT NULL AND (started_at >= ? OR started_at >= ?)", (since_iso, since_utc))
+        rogues_caught = (await cur.fetchone())[0]
+        await cur.execute("SELECT COUNT(*) FROM alliances WHERE created_at >= ? OR created_at >= ?", (since_iso, since_utc))
+        new_alliances = (await cur.fetchone())[0]
+        await cur.execute("SELECT COUNT(*) FROM alliances WHERE status = 'approved'")
+        total_alliances = (await cur.fetchone())[0]
+        await cur.execute("SELECT COALESCE(SUM(rps_wins + rps_losses + rps_ties), 0) FROM user_stats")
+        rps_total = (await cur.fetchone())[0]
+        await cur.execute("SELECT COUNT(*) FROM chase_opt_ins")
+        roster = (await cur.fetchone())[0]
+    last_rps = int(await get_guild_setting(guild.id, "report_rps_total") or 0)
+    rps_week = max(0, rps_total - last_rps)
+    await set_guild_setting(guild.id, "report_rps_total", str(rps_total))
+
+    member_role = discord.utils.get(guild.roles, name=ROLE_MEMBER)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    newcomers = [m for m in (member_role.members if member_role else []) if m.joined_at and m.joined_at >= cutoff and not m.bot]
+
+    leaderboard = await compute_leaderboard(guild)
+    top = leaderboard[0] if leaderboard else None
+    top_line = f"<@{top[0]}> leads the all-time board." if top else "No scores on the board yet — be the first."
+
+    embed = discord.Embed(
+        title="📰 THE WEEKLY PRECINCT REPORT",
+        description=f"Seven days in {guild.name}, in one post. 🚔",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(),
+    )
+    embed.add_field(name="👥 Roll call", value=(
+        f"**{len(newcomers)}** new Chief(s) sworn in" + (": " + ", ".join(m.mention for m in newcomers[:8]) + ("…" if len(newcomers) > 8 else "") if newcomers else "") +
+        f"\n**{total_alliances}** alliance(s) on the books" + (f" (+{new_alliances} this week)" if new_alliances else "")
+    ), inline=False)
+    embed.add_field(name="🎮 Games", value=(
+        f"🕵️ Cops & Robbers: **{chases}** round(s) played · **{roster}** on the roster (needs {CHASE_MIN_PARTICIPANTS} — join in #⚙️-settings)\n"
+        f"✊ Rock-Paper-Scissors: **{rps_week}** game(s)\n"
+        f"🤖 Rogue RoboCops caught: **{rogues_caught}**"
+    ), inline=False)
+    embed.add_field(name="🏆 Standings", value=f"{top_line} `/stats top10` for the full board, `/stats monthly` for this month's race.", inline=False)
+    embed.set_footer(text="Published Sundays. Quiet week? Then it's a short report.")
+    return embed
+
+
+async def weekly_precinct_report_scheduler(guild):
+    """(10.0) Replaces the daily stats digest: ONE post, Sunday at the
+    configured hour, covering the week. Nothing is posted mid-week."""
     while True:
         try:
             tz = await get_guild_timezone(guild.id)
-            stats_hour = await get_config_value(guild.id, "game_stats_hour")
+            hour = await get_config_value(guild.id, "game_stats_hour")
             now_local = datetime.now(tz)
-            next_run = now_local.replace(hour=stats_hour, minute=0, second=0, microsecond=0)
+            days_ahead = (6 - now_local.weekday()) % 7  # Sunday = 6
+            next_run = (now_local + timedelta(days=days_ahead)).replace(hour=hour, minute=0, second=0, microsecond=0)
             if next_run <= now_local:
-                next_run += timedelta(days=1)
+                next_run += timedelta(days=7)
             await asyncio.sleep((next_run - now_local).total_seconds())
 
             if not _is_leader:
                 continue
-            general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+            general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
             if not general_ch:
                 continue
-            embed = await build_game_stats_embed(guild)
-            embed.title = "📊 DAILY GAME STATS DIGEST"
-            await general_ch.send(embed=embed)
+            week_key = datetime.now(tz).strftime("%G-W%V")
+            if (await get_guild_setting(guild.id, "precinct_report_week") or "") == week_key:
+                continue  # already posted this week (restart safety)
+            await general_ch.send(embed=await build_precinct_report_embed(guild))
+            await set_guild_setting(guild.id, "precinct_report_week", week_key)
         except Exception as e:
-            print(f"[ERROR] Daily game-stats scheduler hit an error, will retry tomorrow: {e}")
+            print(f"[ERROR] Weekly precinct report hit an error, will retry in an hour: {e}")
             await asyncio.sleep(3600)
 
 
@@ -9231,9 +9701,36 @@ async def daily_chase_scheduler(guild):
             success, message = await start_chase_round(guild, "🕛 Automatic Daily Chase")
             if not success:
                 await log_event(guild, f"ℹ️ **DAILY CHASE SKIPPED**\n{message}")
+                await maybe_post_roster_call(guild)
         except Exception as e:
             print(f"[ERROR] Daily chase scheduler hit an error, will retry tomorrow: {e}")
             await asyncio.sleep(3600)  # back off an hour rather than tight-looping on a persistent error
+
+
+async def maybe_post_roster_call(guild):
+    """When the daily chase can't run for lack of players, ONE public line
+    with a join button — never a DM. At most once a day, and only when the
+    roster count has changed since the last call, so a quiet server isn't
+    nagged with the same message every noon."""
+    n = await chase_roster_size(guild)
+    if n >= CHASE_MIN_PARTICIPANTS:
+        return
+    last = await get_guild_setting(guild.id, "chase_roster_call") or ""
+    today = datetime.now().strftime("%Y-%m-%d")
+    last_day, _, last_n = last.partition("|")
+    if last_day == today or last_n == str(n):
+        return
+    ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
+    if not ch:
+        return
+    try:
+        await ch.send(
+            f"🕵️ **Cops & Robbers needs {CHASE_MIN_PARTICIPANTS} volunteers to run** — {n} signed up so far. "
+            f"Secret roles, poetic clues, zero commitment. Want in on the next one?",
+            view=ChaseRosterView())
+        await set_guild_setting(guild.id, "chase_roster_call", f"{today}|{n}")
+    except discord.HTTPException:
+        pass
 
 
 async def schedule_chase_recruit_dm(member, delay_seconds: float):
@@ -9242,20 +9739,19 @@ async def schedule_chase_recruit_dm(member, delay_seconds: float):
     if not guild.get_member(member.id):
         return  # they've left since
     try:
+        if await chase_is_opted_in(member.id):
+            return  # they already joined from a button — no need to ask
         await member.send(embed=discord.Embed(
-            title="🕵️ A Word From The Grapevine",
+            title="🕵️ A Word From The Grapevine (one-time invite)",
             description=(
-                "Word on the street is you've been keeping your nose clean here for a few hours now.\n\n"
-                "Every day at noon, this precinct runs something a little different: **Cops & Robbers**. "
-                "Roles get handed out in secret — you might already have played without knowing it, or you "
-                "might get pulled into the next one. Cops hunt with poetic clues. Robbers hide in plain "
-                "sight, and can strike back. Nobody finds out who's who until someone gets caught, or the "
-                "six hours run out.\n\n"
-                "You're automatically in the mix for future rounds. Not your thing? Run `/leave-chase` any "
-                "time to sit it out.\n\nSee you in the shadows, Chief."
+                "Every day at noon this precinct runs **Cops & Robbers**: roles handed out in secret, cops hunt "
+                "with poetic clues, robbers hide in plain sight and can strike back. Nobody knows who's who until "
+                "someone gets caught or the clock runs out.\n\n"
+                "It's **opt-in** — you'll only ever be drafted (or DMed about it) if you say so. "
+                "This is the only time I'll ask; the buttons below, `/chase join`, and #⚙️-settings all work any time."
             ),
             color=discord.Color.dark_purple()
-        ))
+        ), view=ChaseRosterView())
     except discord.Forbidden:
         pass
     async with db_connect() as conn:
@@ -9297,7 +9793,16 @@ async def chase_leaderboard_syndication_loop(guild):
         try:
             if not _is_leader:
                 continue
+            # (10.0) Only when a round has actually ended since the last post —
+            # the same top-5 twice a day, every day, is wallpaper.
+            async with db_connect() as conn:
+                cur = await conn.cursor()
+                await cur.execute("SELECT COUNT(*) FROM chase_rounds WHERE status = 'ended'")
+                ended = str((await cur.fetchone())[0])
+            if ended == (await get_guild_setting(guild.id, "chase_leaderboard_fingerprint") or ""):
+                continue
             await post_chase_leaderboard(guild)
+            await set_guild_setting(guild.id, "chase_leaderboard_fingerprint", ended)
         except Exception as e:
             print(f"[ERROR] Chase leaderboard syndication hit an error, will retry next cycle: {e}")
 
@@ -9305,10 +9810,6 @@ async def chase_leaderboard_syndication_loop(guild):
 # ============================================================
 #  SLASH COMMANDS (ADMIN ONLY)
 # ============================================================
-@bot.tree.command(name="unban", description="Unbans a user from Discord and resets their Robocop infractions.")
-@app_commands.describe(user_id="Discord User ID (right-click user -> Copy User ID)")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def unban_user(interaction: discord.Interaction, user_id: str):
     try:
         uid = int(user_id.strip())
@@ -9336,10 +9837,6 @@ async def unban_user(interaction: discord.Interaction, user_id: str):
         await interaction.response.send_message(f"❌ An error occurred: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="pardon", description="Clears active timeouts, resets invite fails, and releases prisoners.")
-@app_commands.describe(user_id="Discord User ID (right-click user -> Copy User ID)")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def pardon(interaction: discord.Interaction, user_id: str):
     await interaction.response.defer(ephemeral=True)
     try:
@@ -9376,9 +9873,6 @@ async def pardon(interaction: discord.Interaction, user_id: str):
     await log_event(interaction.guild, f"🕊️ **USER PARDONED**\nAdmin: {interaction.user.mention}\nTarget ID: {uid}\nAction: Infractions cleared. Released from restrictions.")
 
 
-@bot.tree.command(name="re-check-nicknames", description="Audits nickname compliance against actual current roles, with one-click fixes.")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def re_check_nicknames(interaction: discord.Interaction):
     async with server_busy("re-checking every nickname on the server"):
         await interaction.response.send_message("🔍 Auditing nicknames against current roles...", ephemeral=True)
@@ -9447,8 +9941,8 @@ async def re_check_nicknames(interaction: discord.Interaction):
                 pass
 
 
-@bot.tree.command(name="imprison", description="Lock a user in solitary confinement. Strips roles to prevent bypass.")
-@app_commands.describe(nickname="Base in-game name (no tags)", minutes="Minutes to lock up")
+@bot.tree.command(name="imprison", description="Judge+: lock someone in solitary for N minutes. Roles are held and given back on release.")
+@app_commands.describe(nickname="Their in-game name — the part before the [TAG]. Close enough is fine; I'll offer matches.", minutes="How many minutes. Auto-released after.")
 @app_commands.default_permissions(kick_members=True)
 @is_staff()
 async def imprison(interaction: discord.Interaction, nickname: str, minutes: int):
@@ -9458,7 +9952,29 @@ async def imprison(interaction: discord.Interaction, nickname: str, minutes: int
 
     target = find_member_by_base_name(interaction.guild, nickname)
     if not target:
-        await interaction.response.send_message(f"❌ Could not find user matching base name '{nickname}'.", ephemeral=True)
+        # Did you mean...? Closest three base names, as buttons, instead of a dead end.
+        want = nickname.strip().lower()
+        scored = sorted(
+            ((SequenceMatcher(None, clean_display_name(m.display_name), want).ratio(), m) for m in interaction.guild.members if not m.bot),
+            key=lambda t: -t[0]
+        )
+        close = [m for score, m in scored[:3] if score >= 0.5]
+        if not close:
+            await interaction.response.send_message(f"❌ Nobody here matches **{nickname}**. Use their in-game name (the part before the [TAG]).", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=60.0)
+        for m in close:
+            b = discord.ui.Button(label=f"⛓️ {m.display_name[:70]}", style=discord.ButtonStyle.danger)
+
+            async def cb(i: discord.Interaction, m=m):
+                if i.user.id != interaction.user.id:
+                    await i.response.send_message("🚔 Not your button, Chief.", ephemeral=True)
+                    return
+                view.stop()
+                await imprison(i, clean_display_name(m.display_name), minutes)
+            b.callback = cb
+            view.add_item(b)
+        await interaction.response.send_message(f"🤔 No exact match for **{nickname}** — did you mean one of these? (Click to imprison for {minutes} min.)", view=view, ephemeral=True)
         return
 
     prison_role = discord.utils.get(interaction.guild.roles, name=ROLE_PRISONER)
@@ -9514,9 +10030,6 @@ async def imprison(interaction: discord.Interaction, nickname: str, minutes: int
         await interaction.followup.send(f"❌ An error occurred: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="approve-tag", description="Unlocks quarantined alliance & removes Drunk Tank.")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def approve_tag(interaction: discord.Interaction, tag: str):
     tag = normalize_alliance_key(tag)
     did_something = await approve_alliance(interaction.guild, tag, approver_label=interaction.user.mention)
@@ -9594,8 +10107,8 @@ async def announce(interaction: discord.Interaction, message: str):
     await log_event(guild, f"📢 **ANNOUNCEMENT BROADCAST**\nBy: {user.mention}\nScope: {scope_label}\nChannels reached: {sent}\nMessage: {message[:500]}")
 
 
-@bot.tree.command(name="killswitch", description="Emergency lockdown pausing chat.")
-@app_commands.describe(minutes="Minutes to lockdown (1-30)", off="Turn off lockdown")
+@bot.tree.command(name="killswitch", description="Judge+: emergency lockdown — nobody can chat. Blank minutes = 1 minute. Add off:True to lift it.")
+@app_commands.describe(minutes="How long to lock chat, 1–30. Blank = 1 minute (it auto-lifts after).", off="True = lift the lockdown now instead.")
 @app_commands.default_permissions(kick_members=True)
 @is_staff()
 async def killswitch(interaction: discord.Interaction, minutes: int = 1, off: bool = False):
@@ -9667,8 +10180,8 @@ async def killswitch(interaction: discord.Interaction, minutes: int = 1, off: bo
         pass
 
 
-@bot.tree.command(name="warn", description="Issue a formal warning to a member.")
-@app_commands.describe(member="The member to warn", reason="Why they're being warned")
+@bot.tree.command(name="warn", description="Judge+: put a formal warning on someone's record (they're told, it's logged, /record shows it).")
+@app_commands.describe(member="Who to warn.", reason="Why — one clear sentence. They will see this.")
 @app_commands.default_permissions(kick_members=True)
 @is_staff()
 async def warn(interaction: discord.Interaction, member: discord.Member, reason: str):
@@ -9705,10 +10218,6 @@ async def warn(interaction: discord.Interaction, member: discord.Member, reason:
         pass
 
 
-@bot.tree.command(name="warnings", description="View a member's warning history.")
-@app_commands.describe(member="The member to check")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def warnings_cmd(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
     async with db_connect() as conn:
@@ -9725,9 +10234,6 @@ async def warnings_cmd(interaction: discord.Interaction, member: discord.Member)
     await interaction.followup.send(out[:2000], ephemeral=True)
 
 
-@bot.tree.command(name="server-stats", description="View tracked usage statistics — translations, referrals, RPS records, and more.")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def server_stats(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     async with db_connect() as conn:
@@ -9787,9 +10293,6 @@ async def server_stats(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="show-banned", description="Displays permanently banned users & infraction logs.")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def show_banned(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     async with db_connect() as conn:
@@ -9803,10 +10306,6 @@ async def show_banned(interaction: discord.Interaction):
     await interaction.followup.send(out[:2000], ephemeral=True)
 
 
-@bot.tree.command(name="add-request-role", description="Adds custom role option to database.")
-@app_commands.describe(role="Role name", description="Role description")
-@app_commands.default_permissions(manage_channels=True)
-@is_senior_staff()
 async def add_request_role(interaction: discord.Interaction, role: str, description: str):
     await interaction.response.defer(ephemeral=True)
     async with db_connect() as conn:
@@ -9816,13 +10315,6 @@ async def add_request_role(interaction: discord.Interaction, role: str, descript
     await interaction.followup.send(f"✅ Custom role option **{role}** added to database.", ephemeral=True)
 
 
-@bot.tree.command(name="configure-setting", description="View or change a live-adjustable setting.")
-@app_commands.describe(setting="Which setting to view or change", value="New value (leave blank to just view the current value)")
-@app_commands.choices(setting=[
-    app_commands.Choice(name=meta["label"][:100], value=key) for key, meta in CONFIGURABLE_SETTINGS.items()
-])
-@app_commands.default_permissions(manage_channels=True)
-@is_senior_staff()
 async def configure_setting(interaction: discord.Interaction, setting: str, value: str = None):
     meta = CONFIGURABLE_SETTINGS[setting]
     current = await get_config_value(interaction.guild.id, setting)
@@ -9861,38 +10353,23 @@ async def configure_setting(interaction: discord.Interaction, setting: str, valu
     await log_event(interaction.guild, f"🔧 **SETTING CHANGED**\nBy: {interaction.user.mention}\n{meta['label']}: `{current}` → `{new_value}`")
 
 
-@bot.tree.command(name="toggle-innovator-program", description="Turn future automatic Innovator badge grants on or off.")
-@app_commands.describe(active="True to keep granting the badge to new registrants, False to stop")
-@app_commands.default_permissions(manage_channels=True)
-@is_senior_staff()
 async def toggle_innovator_program(interaction: discord.Interaction, active: bool):
     await set_guild_setting(interaction.guild.id, "innovator_program_active", "1" if active else "0")
     status = "ON — new registrants will keep getting the badge" if active else "OFF — no new Innovator badges will be granted"
     await interaction.response.send_message(f"🌟 Innovator program is now **{status}**. Existing badge holders are unaffected either way.", ephemeral=True)
 
 
-@bot.tree.command(name="toggle-rogue-bot-program", description="Turn the automatic Rogue RoboCop round (triggered by version handoffs) on or off.")
-@app_commands.describe(active="True for normal operation, False to suppress it — handy during a deliberate migration/adoption event")
-@app_commands.default_permissions(manage_channels=True)
-@is_senior_staff()
 async def toggle_rogue_bot_program(interaction: discord.Interaction, active: bool):
     await set_guild_setting(interaction.guild.id, "rogue_bot_program_active", "1" if active else "0")
     status = "ON — a real version handoff will kick off a round as usual" if active else "OFF — version handoffs won't start a round until this is turned back on"
     await interaction.response.send_message(f"🕵️ Rogue RoboCop program is now **{status}**. Any round already in progress is unaffected either way.", ephemeral=True)
 
 
-@bot.tree.command(name="announce-update", description="Manually fire the system-update announcement and brief lockdown, without waiting for a live handoff.")
-@app_commands.default_permissions(administrator=True)
-@is_dictator()
 async def announce_update(interaction: discord.Interaction):
     await interaction.response.send_message("📢 Sending it now...", ephemeral=True)
     await announce_version_handoff(interaction.guild)
 
 
-@bot.tree.command(name="bulk-onboard-existing", description="Bulk-register everyone already in the server — for adopting an existing single-alliance server.")
-@app_commands.describe(tag="The alliance tag to assume for everyone", servers="Server number(s) to assume for everyone, comma-separated (e.g. 21,121)")
-@app_commands.default_permissions(administrator=True)
-@is_dictator()
 async def bulk_onboard_existing(interaction: discord.Interaction, tag: str, servers: str):
     async with server_busy("onboarding a whole alliance at once"):
         guild = interaction.guild
@@ -9909,7 +10386,7 @@ async def bulk_onboard_existing(interaction: discord.Interaction, tag: str, serv
 
         tag_role = discord.utils.get(guild.roles, name=tag)
         if not tag_role:
-            await interaction.response.send_message(f"❌ No **{tag}** role exists yet — run `/adopt-alliance {tag}` first.", ephemeral=True)
+            await interaction.response.send_message(f"❌ No **{tag}** role exists yet — run `/admin-tools adopt-alliance tag:{tag}` first.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -9983,12 +10460,12 @@ async def bulk_onboard_existing(interaction: discord.Interaction, tag: str, serv
                     description=(
                         f"This server just got upgraded, and you've been carried over as **[{tag}]**, server "
                         f"**{srv_display}** — no action needed on your part, that's already done.\n\n"
-                        f"A couple of things worth knowing: run `/abilities` any time (also works great in "
+                        f"A couple of things worth knowing: run `/help` any time (also works great in "
                         f"{abilities_ch.mention if abilities_ch else '#❓-abilities'}) for a full rundown of what you "
                         f"can do. And if you actually play on more than just server {srv_display}, head to "
                         f"{role_req_ch.mention if role_req_ch else '#⚙️-role-requests'} to add any other servers you're "
                         f"on — I only assumed the one for now.\n\n"
-                        f"If your in-game name isn't quite right, `/nickname` lets you fix that any time too."
+                        f"If your in-game name isn't quite right, `/fix-me nicknames` lets you fix that any time too."
                     ),
                     color=discord.Color.blue()
                 ))
@@ -10001,8 +10478,8 @@ async def bulk_onboard_existing(interaction: discord.Interaction, tag: str, serv
             f"✅ **Bulk onboarding complete.**\nRegistered: **{onboarded}**\nAlready registered (skipped): **{skipped}**\n\n"
             f"Everyone registered got: name = their current display name, alliance = [{tag}], servers = {srv_display}, "
             f"rank = whatever [{tag}]-R4/R5 role they already held (else plain Member) — plus a DM pointing them at "
-            f"`/abilities` and #⚙️-role-requests for any other servers they actually play on beyond {srv_display}. "
-            f"Anyone can correct their own name any time with `/nickname`.",
+            f"`/help` and #⚙️-role-requests for any other servers they actually play on beyond {srv_display}. "
+            f"Anyone can correct their own name any time with `/fix-me nicknames`.",
             ephemeral=True
         )
         await log_event(guild, f"📇 **BULK ONBOARDING**\nBy: {interaction.user.mention}\nTag: [{tag}]\nServers: {srv_display}\nRegistered: {onboarded} | Skipped: {skipped}")
@@ -10015,74 +10492,8 @@ async def bulk_onboard_existing(interaction: discord.Interaction, tag: str, serv
 #  choice from a live-fetched list of what's actually there — nothing is
 #  guessed or auto-matched by name.
 # ------------------------------------------------------------
-@bot.tree.command(name="ptd-reset", description="Clears PTD's alliance registration for a clean /ptd-upgrade-now retry. Channels/roles untouched.")
-@app_commands.default_permissions(administrator=True)
-@is_dictator()
-async def ptd_reset(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    async with db_connect() as conn:
-        cur = await conn.cursor()
-        await cur.execute("DELETE FROM alliances WHERE tag = 'PTD'")
-        deleted = cur.rowcount
-        await conn.commit()
-
-    if deleted:
-        await interaction.followup.send(
-            "✅ Cleared PTD's alliance registration. `/ptd-upgrade-now` will run as a full fresh attempt now — "
-            "anything already correct (channels, roles, individual registrations) will still just be recognized "
-            "and skipped, not redone or broken.",
-            ephemeral=True
-        )
-        await log_event(interaction.guild, f"🔄 **PTD REGISTRATION RESET** by {interaction.user.mention} — ready for a clean /ptd-upgrade-now run.")
-    else:
-        await interaction.followup.send("ℹ️ PTD wasn't registered as an alliance yet — nothing to clear. `/ptd-upgrade-now` should already run fresh.", ephemeral=True)
 
 
-@bot.tree.command(name="ptd-upgrade-now", description="One-shot: adopt PTD's channels, migrate legacy roles, and register everyone. No wizard needed.")
-@app_commands.default_permissions(administrator=True)
-@is_dictator()
-async def ptd_upgrade_now(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-    tag = "PTD"
-    servers = ["21"]
-
-    async with db_connect() as conn:
-        cur = await conn.cursor()
-        await cur.execute("SELECT status FROM alliances WHERE tag = ?", (tag,))
-        existing = await cur.fetchone()
-    if existing:
-        await interaction.followup.send(
-            f"ℹ️ **[{tag}]** is already registered (status: `{existing[0]}`). This command is for the first run only — "
-            f"if something needs redoing, that's a different, more targeted fix.",
-            ephemeral=True
-        )
-        return
-
-    await interaction.followup.send("🚨 **INITIATING FULL PRECINCT UPGRADE — PTD DIVISION.** Standing by while every unit gets processed. Full report incoming the moment it's done.", ephemeral=True)
-    log_lines = []
-
-    # Guaranteed feedback, no matter what happens: if ANYTHING unexpected
-    # throws partway through, this catches it, reports exactly how far it
-    # got using whatever's already in log_lines, and posts the real error
-    # to both the admin and #logs — never just silence.
-    try:
-        async with server_busy("upgrading the whole PTD precinct"):
-            await _execute_ptd_upgrade(interaction, guild, tag, servers, log_lines)
-    except Exception as e:
-        print(f"[PTD UPGRADE ERROR] {type(e).__name__}: {e}")
-        partial_summary = "\n".join(f"• {line}" for line in log_lines) if log_lines else "(nothing completed yet — it broke on the very first step)"
-        error_msg = (
-            f"🚨 **PTD upgrade hit an unexpected error and stopped partway through.**\n\n"
-            f"**What completed before it broke:**\n{partial_summary}\n\n"
-            f"**Error:** `{type(e).__name__}: {e}`\n\n"
-            f"Nothing after this point ran. Safe to fix the underlying issue and run `/ptd-upgrade-now` again — "
-            f"anything already done will just be recognized as already-complete and skipped."
-        )
-        await send_long(interaction.followup, error_msg, ephemeral=True)
-        log_channel = discord.utils.get(guild.channels, name="logs")
-        if log_channel:
-            await send_long(log_channel, error_msg)
 
 
 async def _execute_ptd_upgrade(interaction: discord.Interaction, guild, tag: str, servers: list, log_lines: list):
@@ -10141,20 +10552,20 @@ async def _execute_ptd_upgrade(interaction: discord.Interaction, guild, tag: str
             await guild.create_text_channel(new_name, category=category)
             log_lines.append(f"➕ Created **{new_name}**.")
 
-    existing_general = discord.utils.get(guild.channels, name="💬-general-chat")
+    existing_general = discord.utils.get(guild.channels, name=CH_EVERYONE)
     old_lobby = discord.utils.get(category.text_channels, name="lobby")
     if not existing_general and old_lobby:
         main_text_cat = discord.utils.get(guild.categories, name="🏢 MAIN PRECINCT")
         try:
-            await old_lobby.edit(name="💬-general-chat", category=main_text_cat)
-            log_lines.append("💬 Moved **#lobby** to the shared community area as **#💬-general-chat**.")
+            await old_lobby.edit(name=CH_EVERYONE, category=main_text_cat)
+            log_lines.append("💬 Moved **#lobby** to the shared community area as **#🌍-everyone-chat**.")
         except discord.HTTPException as e:
             log_lines.append(f"⚠️ Couldn't repurpose #lobby: {e}")
         await guild.create_text_channel("💬-lobby", category=category)
         log_lines.append("💬 Created a fresh **#💬-lobby** for PTD.")
     elif existing_general and not discord.utils.get(category.text_channels, name="💬-lobby"):
         await guild.create_text_channel("💬-lobby", category=category)
-        log_lines.append("💬 **#💬-general-chat** already existed — created **#💬-lobby** for PTD alongside it.")
+        log_lines.append("💬 **#🌍-everyone-chat** already existed — created **#💬-lobby** for PTD alongside it.")
 
     welcome_ch = discord.utils.get(category.text_channels, name="welcome")
     if welcome_ch:
@@ -10323,10 +10734,10 @@ async def _execute_ptd_upgrade(interaction: discord.Interaction, guild, tag: str
                 description=(
                     f"This server just got upgraded, and you've been carried over as **[{tag}]**, server "
                     f"**{srv_display}** — no action needed on your part, that's already done.\n\n"
-                    f"Run `/abilities` any time (also works great in {abilities_ch.mention if abilities_ch else '#❓-abilities'}) "
+                    f"Run `/help` any time (also works great in {abilities_ch.mention if abilities_ch else '#❓-abilities'}) "
                     f"for a full rundown of what you can do. And if you actually play on more than just server "
                     f"{srv_display}, head to {role_req_ch.mention if role_req_ch else '#⚙️-role-requests'} to add any "
-                    f"other servers you're on.\n\nIf your in-game name isn't quite right, `/nickname` fixes that any time."
+                    f"other servers you're on.\n\nIf your in-game name isn't quite right, `/fix-me nicknames` fixes that any time."
                 ),
                 color=discord.Color.blue()
             ))
@@ -10356,10 +10767,6 @@ async def _execute_ptd_upgrade(interaction: discord.Interaction, guild, tag: str
     )
 
 
-@bot.tree.command(name="adopt-alliance", description="Adopt an existing alliance's channels/roles into our structure, one confirmed step at a time.")
-@app_commands.describe(tag="The alliance's tag (2-4 letters)")
-@app_commands.default_permissions(administrator=True)
-@is_dictator()
 async def adopt_alliance(interaction: discord.Interaction, tag: str):
     tag = tag.strip().upper()
     if not (2 <= len(tag) <= 4 and tag.isalpha()):
@@ -10464,7 +10871,7 @@ class AdoptionMappingConfirmButton(discord.ui.Button):
         await interaction.response.edit_message(
             content=(
                 f"📇 **Step 3 of 4 — [{view.state.tag}] special cases**\n\n"
-                "Should any channel here actually become the server-wide **#💬-general-chat** instead of staying "
+                "Should any channel here actually become the server-wide **#🌍-everyone-chat** instead of staying "
                 "alliance-specific? (If you pick one, a fresh, empty lobby gets created for this alliance "
                 "afterward, since the original is moving to a shared role.)\n\n"
                 "Anything not otherwise assigned can be archived (moved to Admin-Only, hidden, history kept) — "
@@ -10703,14 +11110,14 @@ async def execute_alliance_adoption(guild, state: AllianceAdoptionState) -> str:
             log_lines.append("🎖️ Created **#🎖️-leadership-chat**.")
 
         if state.general_chat_source:
-            existing_general = discord.utils.get(guild.channels, name="💬-general-chat")
+            existing_general = discord.utils.get(guild.channels, name=CH_EVERYONE)
             if existing_general:
-                log_lines.append(f"ℹ️ **#💬-general-chat** already exists — left **#{state.general_chat_source.name}** where it is rather than creating a duplicate.")
+                log_lines.append(f"ℹ️ **#🌍-everyone-chat** already exists — left **#{state.general_chat_source.name}** where it is rather than creating a duplicate.")
             else:
                 main_text_cat = discord.utils.get(guild.categories, name="🏢 MAIN PRECINCT")
                 try:
-                    await state.general_chat_source.edit(name="💬-general-chat", category=main_text_cat)
-                    log_lines.append(f"💬 Moved **#{state.general_chat_source.name}** to the shared community area as **#💬-general-chat**.")
+                    await state.general_chat_source.edit(name=CH_EVERYONE, category=main_text_cat)
+                    log_lines.append(f"💬 Moved **#{state.general_chat_source.name}** to the shared community area as **#🌍-everyone-chat**.")
                 except discord.HTTPException as e:
                     log_lines.append(f"⚠️ Couldn't repurpose general-chat: {e}")
 
@@ -10846,8 +11253,8 @@ async def check_adoption_readiness(guild):
                 "A full, private walkthrough has been sent to whoever holds Dictator. Short version — the "
                 "**STARTUP DIAGNOSTIC** message also posted in #logs carries a button for exactly this (no "
                 "typing, so nothing can silently fail to register as a real click): 🚔 Convert Everyone + "
-                "Migrate Ranks → hand-assign any special identities → `/announce-update`. Typed "
-                "equivalents exist too (`/adopt-alliance`, `/migrate-legacy-roles`, `/bulk-onboard-existing`) "
+                "Migrate Ranks → hand-assign any special identities → `/admin-tools announce-update`. Typed "
+                "equivalents exist too (`/admin-tools adopt-alliance / migrate-legacy-roles / bulk-onboard`) "
                 "if you'd rather.\n\n"
                 "This keeps showing up at every startup until it's actually resolved."
             ),
@@ -10885,7 +11292,7 @@ async def check_adoption_readiness(guild):
         inline=False
     )
     walkthrough.add_field(
-        name="1️⃣ /adopt-alliance <tag>",
+        name="1️⃣ /admin-tools adopt-alliance tag:<tag>",
         value=(
             "Brings the alliance's existing channels — lobby, strategy, screenshots, whatever's already there — "
             "into the structure I expect, without losing any of it. You'll confirm each channel mapping yourself; "
@@ -10894,7 +11301,7 @@ async def check_adoption_readiness(guild):
         inline=False
     )
     walkthrough.add_field(
-        name="2️⃣ /migrate-legacy-roles",
+        name="2️⃣ /admin-tools migrate-legacy-roles",
         value=(
             "Finds old rank roles (R2, R3, R4, R5, a plain \"Admin\" role, etc.) and walks you through mapping "
             "each one into the new system, one at a time, with a chance to confirm or skip each."
@@ -10902,10 +11309,10 @@ async def check_adoption_readiness(guild):
         inline=False
     )
     walkthrough.add_field(
-        name="3️⃣ /bulk-onboard-existing <tag> <servers>",
+        name="3️⃣ /admin-tools bulk-onboard tag:<tag> servers:<servers>",
         value=(
             "Registers everyone already in the server and formats their name properly. Tell it which server "
-            "number(s) actually apply — I won't guess. Everyone gets a DM afterward pointing them at `/abilities` "
+            "number(s) actually apply — I won't guess. Everyone gets a DM afterward pointing them at `/help` "
             "and #⚙️-role-requests in case they're on more servers than you assumed."
         ),
         inline=False
@@ -10919,7 +11326,7 @@ async def check_adoption_readiness(guild):
         inline=False
     )
     walkthrough.add_field(
-        name="5️⃣ /announce-update",
+        name="5️⃣ /admin-tools announce-update",
         value="Once everything above is actually done, this tells everyone at once, on your own schedule.",
         inline=False
     )
@@ -11120,9 +11527,6 @@ class LegacyRankRoleView(discord.ui.View):
         await show_next_legacy_step(interaction, self.state)
 
 
-@bot.tree.command(name="migrate-legacy-roles", description="Scan for old rank/admin roles from before this bot and map them into the new system, one at a time.")
-@app_commands.default_permissions(administrator=True)
-@is_dictator()
 async def migrate_legacy_roles(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     admin_roles, rank_roles = await scan_legacy_roles(interaction.guild)
@@ -11134,9 +11538,6 @@ async def migrate_legacy_roles(interaction: discord.Interaction):
     await show_next_legacy_step(interaction, state, use_followup=True)
 
 
-@bot.tree.command(name="grant-innovator-all", description="One-time bulk grant: Innovator badge for everyone currently in the server, bypassing the usual caps.")
-@app_commands.default_permissions(administrator=True)
-@is_dictator()
 async def grant_innovator_to_current_members(interaction: discord.Interaction):
     guild = interaction.guild
     innovator_role = discord.utils.get(guild.roles, name=ROLE_INNOVATOR)
@@ -11164,7 +11565,7 @@ async def grant_innovator_to_current_members(interaction: discord.Interaction):
             granted_members.append(member)
 
     if granted_members:
-        general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+        general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
         if general_ch:
             try:
                 await general_ch.send(embed=discord.Embed(
@@ -11205,9 +11606,6 @@ async def grant_innovator_to_current_members(interaction: discord.Interaction):
     await log_event(guild, f"🌟 **INNOVATOR BULK GRANT**\nBy: {interaction.user.mention}\nGranted: {len(granted_members)} member(s)")
 
 
-@bot.tree.command(name="restore-innovators", description="Re-grant the Innovator badge to everyone recorded in the database, in case roles got reset.")
-@app_commands.default_permissions(administrator=True)
-@is_dictator()
 async def restore_innovators(interaction: discord.Interaction):
     guild = interaction.guild
     innovator_role = discord.utils.get(guild.roles, name=ROLE_INNOVATOR)
@@ -11242,10 +11640,6 @@ async def restore_innovators(interaction: discord.Interaction):
     await log_event(guild, f"🌟 **INNOVATOR BADGES RESTORED**\nBy: {interaction.user.mention}\nRestored: {restored} | No longer in server: {missing}")
 
 
-@bot.tree.command(name="stop-alliance", description="Master kill switch freezing all new alliance creation.")
-@app_commands.describe(lock="True to lock, False to unlock")
-@app_commands.default_permissions(manage_channels=True)
-@is_senior_staff()
 async def stop_alliance(interaction: discord.Interaction, lock: bool):
     await interaction.response.defer(ephemeral=True)
     status = 'locked' if lock else 'unlocked'
@@ -11257,9 +11651,6 @@ async def stop_alliance(interaction: discord.Interaction, lock: bool):
     await log_event(interaction.guild, f"🔒 **ALLIANCE LOCK TOGGLED**\nAdmin: {interaction.user.mention}\nStatus: {status.upper()}")
 
 
-@bot.tree.command(name="release-timekeeper", description="Opens 10-minute burst window (5 tags max).")
-@app_commands.default_permissions(manage_channels=True)
-@is_senior_staff()
 async def release_timekeeper(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     burst_time = (datetime.now() + timedelta(minutes=10)).isoformat()
@@ -11271,9 +11662,6 @@ async def release_timekeeper(interaction: discord.Interaction):
     await log_event(interaction.guild, f"⏱️ **TIMEKEEPER BURST OPENED**\nAdmin: {interaction.user.mention}\nAction: 10-minute rapid creation window activated.")
 
 
-@bot.tree.command(name="database-tools", description="Posts a #logs panel: release current prisoners, or reset the users database.")
-@app_commands.default_permissions(administrator=True)
-@is_dictator()
 async def database_tools(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🛠️ DATABASE TOOLS",
@@ -11294,10 +11682,6 @@ async def database_tools(interaction: discord.Interaction):
     await interaction.response.send_message("🛠️ Posted the database tools panel in #logs.", ephemeral=True)
 
 
-@bot.tree.command(name="configure-servers", description="Set which Police Chief servers this community supports (e.g. '21,121' or '30,17' or '10-15').")
-@app_commands.describe(servers="Comma-separated numbers and/or ranges, e.g. '21,121' or '10-15'")
-@app_commands.default_permissions(manage_channels=True)
-@is_senior_staff()
 async def configure_servers(interaction: discord.Interaction, servers: str):
     new_list = parse_server_spec(servers)
     if not new_list:
@@ -11339,10 +11723,6 @@ async def configure_servers(interaction: discord.Interaction, servers: str):
         await log_channel.send(embed=embed)
 
 
-@bot.tree.command(name="show-role", description="Ephemeral admin audit listing members for a target role.")
-@app_commands.describe(role="The role to audit")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def show_role(interaction: discord.Interaction, role: discord.Role):
     members = [m.display_name for m in role.members]
     if not members:
@@ -11352,10 +11732,6 @@ async def show_role(interaction: discord.Interaction, role: discord.Role):
     await interaction.response.send_message(out[:2000], ephemeral=True)
 
 
-@bot.tree.command(name="show-db-fields", description="Lists all database fields and values for a user.")
-@app_commands.describe(member="The server member to inspect")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def show_db_fields(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.defer(ephemeral=True)
     async with db_connect() as conn:
@@ -11374,16 +11750,6 @@ async def show_db_fields(interaction: discord.Interaction, member: discord.Membe
     await interaction.followup.send(out[:2000], ephemeral=True)
 
 
-@bot.tree.command(name="show-field", description="Lists everything in the database sorted by a specific field.")
-@app_commands.describe(field="Choose field to sort/filter by")
-@app_commands.choices(field=[
-    app_commands.Choice(name="Alliance Tag", value="alliance_tag"),
-    app_commands.Choice(name="Server Number", value="server_number"),
-    app_commands.Choice(name="Rank Designation", value="rank_designation"),
-    app_commands.Choice(name="In-Game Name", value="in_game_name")
-])
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def show_field(interaction: discord.Interaction, field: str):
     allowed_fields = {"alliance_tag", "server_number", "rank_designation", "in_game_name"}
     if field not in allowed_fields:
@@ -11407,7 +11773,6 @@ async def show_field(interaction: discord.Interaction, field: str):
     await interaction.response.send_message(out[:2000], ephemeral=True)
 
 
-@bot.tree.command(name="alliance-leaderboard", description="Shows alliance member counts, ranked.")
 async def alliance_leaderboard(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
@@ -11447,25 +11812,8 @@ async def alliance_leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="start-chase", description="Manually start a round of Cops & Robbers right now.")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
-async def start_chase(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    success, message = await start_chase_round(interaction.guild, interaction.user.mention)
-    await interaction.followup.send(message, ephemeral=True)
 
 
-@bot.tree.command(name="end-chase", description="End the current Cops & Robbers round early.")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
-async def end_chase(interaction: discord.Interaction):
-    active = await get_active_chase_round(interaction.guild)
-    if not active:
-        await interaction.response.send_message("ℹ️ There's no chase currently running.", ephemeral=True)
-        return
-    await interaction.response.send_message("🛑 Ending the current chase...", ephemeral=True)
-    await end_chase_round(interaction.guild, active[0], f"🛑 Ended early by {interaction.user.mention}.")
 
 
 # ------------------------------------------------------------
@@ -11527,11 +11875,6 @@ async def _delayed_game_start(guild, game_value: str, label: str, minutes: int, 
         print(f"[ERROR] Delayed game-start for {game_value} failed: {e}")
 
 
-@bot.tree.command(name="game-start", description="Start Cops & Robbers or Rogue RoboCop now, or schedule it for N minutes from now.")
-@app_commands.describe(game="Which game to start", in_minutes="Optional: wait this many minutes before starting")
-@app_commands.choices(game=GAME_CHOICES)
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def game_start(interaction: discord.Interaction, game: app_commands.Choice[str], in_minutes: Optional[int] = None):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
@@ -11544,11 +11887,6 @@ async def game_start(interaction: discord.Interaction, game: app_commands.Choice
     await interaction.followup.send(message, ephemeral=True)
 
 
-@bot.tree.command(name="game-end", description="End Cops & Robbers or Rogue RoboCop now, optionally auto-restarting it after N minutes.")
-@app_commands.describe(game="Which game to end", resume_in_minutes="Optional: automatically start a fresh round again after this many minutes")
-@app_commands.choices(game=GAME_CHOICES)
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def game_end(interaction: discord.Interaction, game: app_commands.Choice[str], resume_in_minutes: Optional[int] = None):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
@@ -11563,11 +11901,6 @@ async def game_end(interaction: discord.Interaction, game: app_commands.Choice[s
     await interaction.followup.send(message, ephemeral=True)
 
 
-@bot.tree.command(name="game-restart", description="End the current round of a game (if any) and immediately start a fresh one.")
-@app_commands.describe(game="Which game to restart")
-@app_commands.choices(game=GAME_CHOICES)
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def game_restart(interaction: discord.Interaction, game: app_commands.Choice[str]):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
@@ -11576,7 +11909,6 @@ async def game_restart(interaction: discord.Interaction, game: app_commands.Choi
     await interaction.followup.send(f"🔄 Restarted **{game.name}**.\n{message}", ephemeral=True)
 
 
-@bot.tree.command(name="game-stats", description="See running server-wide totals for RPS, Cops & Robbers, and Rogue RoboCop.")
 async def game_stats(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
@@ -11681,7 +12013,7 @@ async def _resolve_chase_guess(interaction: discord.Interaction, guess_text: str
         await interaction.followup.send(random.choice(CHASE_HIT_FLAVOR), ephemeral=True)
 
         verb = "ARRESTED" if guesser_role == "cop" else "AMBUSHED"
-        general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+        general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
         if general_ch:
             target_label = target_member.mention if target_member else f"<@{best_id}>"
             try:
@@ -11709,35 +12041,34 @@ async def _resolve_chase_guess(interaction: discord.Interaction, guess_text: str
         await interaction.followup.send(random.choice(CHASE_COLD_FLAVOR), ephemeral=True)
 
 
-@bot.tree.command(name="leave-chase", description="Opt out of being auto-included in future Cops & Robbers rounds.")
 async def leave_chase(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    async with db_connect() as conn:
-        cur = await conn.cursor()
-        await cur.execute("INSERT OR IGNORE INTO chase_opt_outs (user_id) VALUES (?)", (interaction.user.id,))
-        await conn.commit()
-    await interaction.followup.send("🚪 You're opted out of future Cops & Robbers rounds. Run `/join-chase` any time to opt back in.", ephemeral=True)
+    await chase_set_opt_in(interaction.user.id, False)
+    await interaction.followup.send("🚪 You're off the Cops & Robbers roster — no more drafts, no more game DMs. `/chase join` any time to come back.", ephemeral=True)
 
 
-@bot.tree.command(name="join-chase", description="Opt back in to being included in future Cops & Robbers rounds.")
 async def join_chase(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    async with db_connect() as conn:
-        cur = await conn.cursor()
-        await cur.execute("DELETE FROM chase_opt_outs WHERE user_id = ?", (interaction.user.id,))
-        await conn.commit()
-    await interaction.followup.send("🕵️ You're back in the mix for future Cops & Robbers rounds. See you out there, Chief.", ephemeral=True)
+    await chase_set_opt_in(interaction.user.id, True)
+    n = await chase_roster_size(interaction.guild) if interaction.guild else 0
+    need = max(0, CHASE_MIN_PARTICIPANTS - n)
+    await interaction.followup.send(
+        f"🕵️ You're on the roster ({n} signed up" + (f" — {need} more and the daily chase runs" if need else " — enough for a round!") + "). "
+        "You'll get a DM when you're drafted. See you out there, Chief.", ephemeral=True)
 
 
-@bot.tree.command(name="chase-status", description="Check whether you're in the current Cops & Robbers round.")
 async def chase_status(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     active = await get_active_chase_round(interaction.guild)
+    on_roster = await chase_is_opted_in(interaction.user.id)
+    roster_line = ("✅ You're **on the roster** for future rounds (`/chase leave` to step off)." if on_roster
+                   else "🙅 You're **not on the roster** — you won't be drafted or DMed. Want in? `/chase join`, or the button in #⚙️-settings.")
     if not active:
-        await interaction.followup.send("ℹ️ No chase is currently running.", ephemeral=True)
+        n = await chase_roster_size(interaction.guild)
+        await interaction.followup.send(f"ℹ️ No chase is running right now. {n} on the roster (need {CHASE_MIN_PARTICIPANTS}).\n{roster_line}", ephemeral=True)
         return
     round_id, ends_at_str, last_tier = active
     ends_at = datetime.fromisoformat(ends_at_str)
@@ -11749,7 +12080,7 @@ async def chase_status(interaction: discord.Interaction):
         me = await cur.fetchone()
 
     if not me:
-        await interaction.followup.send(f"You're not part of this round. It ends in about {remaining} minute(s).", ephemeral=True)
+        await interaction.followup.send(f"You're not part of this round. It ends in about {remaining} minute(s).\n{roster_line}", ephemeral=True)
         return
 
     role, eliminated = me
@@ -11794,7 +12125,6 @@ async def catch_cmd(interaction: discord.Interaction, name: str):
         await interaction.followup.send(random.choice(CHASE_COLD_FLAVOR), ephemeral=True)
 
 
-@bot.tree.command(name="stats", description="See your own stats — RPS record, Rogue RoboCop catches, Cops & Robbers, and your overall rank.")
 async def stats_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
@@ -11848,7 +12178,6 @@ async def stats_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="leaderboard", description="See the server's top 10 overall — combining every tracked achievement.")
 async def leaderboard_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
@@ -11876,7 +12205,6 @@ async def leaderboard_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="monthly-standings", description="See this month's gold/silver/bronze standings so far, without resetting anything.")
 async def monthly_standings_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
@@ -11904,10 +12232,6 @@ async def monthly_standings_cmd(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 
-@bot.tree.command(name="set-monthly-prize", description="Set what this month's #1 Monthly Champion actually wins.")
-@app_commands.describe(prize="The prize text to announce for Gold. Leave blank to reset to the default (bragging rights).")
-@app_commands.default_permissions(manage_guild=True)
-@is_senior_staff()
 async def set_monthly_prize(interaction: discord.Interaction, prize: str = None):
     await interaction.response.defer(ephemeral=True)
     prize = (prize or "").strip()
@@ -11920,13 +12244,16 @@ async def set_monthly_prize(interaction: discord.Interaction, prize: str = None)
     await log_event(interaction.guild, f"🏆 **MONTHLY PRIZE UPDATED**\nStaff: {interaction.user.mention}\nNew prize: {prize or DEFAULT_MONTHLY_PRIZE}")
 
 
-@bot.tree.command(name="monthly-champions-now", description="Manually trigger the Monthly Champion announcement right now (also resets standings for next month).")
+@bot.tree.command(name="monthly-champions-now", description="Judge+: announce the Monthly Champion right now and reset this month's standings. Asks first.")
 @app_commands.default_permissions(kick_members=True)
 @is_staff()
 async def monthly_champions_now(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    await announce_monthly_champions(interaction.guild)
-    await interaction.followup.send("✅ Monthly Champion announced (if there were any qualifying scores) and standings have been reset for the new month.", ephemeral=True)
+    async def go(i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        await announce_monthly_champions(i.guild)
+        await i.followup.send("✅ Monthly Champion announced (if there were any qualifying scores) and standings have been reset for the new month.", ephemeral=True)
+    await _confirm(interaction, "📅 Announce this month's champions **now** and **reset the standings**? (Normally happens by itself on the 1st. This can't be undone.)",
+                   go, yes_label="Announce & reset", danger=True)
 
 
 @bot.tree.command(name="rps", description="Challenge another Chief (or Robocop) to Rock, Paper, Scissors.")
@@ -11950,10 +12277,6 @@ async def rps(interaction: discord.Interaction, opponent: discord.Member = None)
     view.message = await interaction.original_response()
 
 
-@bot.tree.command(name="enforce-registration", description="Flag a specific existing member for mandatory registration right now.")
-@app_commands.describe(member="The member who needs to register")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
 async def enforce_registration(interaction: discord.Interaction, member: discord.Member):
     if member.bot:
         await interaction.response.send_message("❌ Can't register a bot.", ephemeral=True)
@@ -12020,7 +12343,7 @@ class AddNicknameModal(discord.ui.Modal, title="Add / Update a Nickname"):
         view = ConfirmActivateNicknameView(self.member, server, nickname)
         await interaction.followup.send(
             f"✅ Saved **{nickname}** for server `{server}`. Want to make this your active display name now?\n\n"
-            + await tf(NAME_CHANGE_REMINDER, self.member.id, abilities=abilities_mention(self.member.guild)),
+            + await tf(NAME_CHANGE_REMINDER, self.member.id),
             view=view, ephemeral=True
         )
 
@@ -12088,7 +12411,6 @@ class NicknameManageView(discord.ui.View):
         await interaction.response.send_modal(AddNicknameModal(self.member))
 
 
-@bot.tree.command(name="nickname", description="Manage your in-game nicknames across different servers.")
 async def nickname_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     async with db_connect() as conn:
@@ -12124,12 +12446,12 @@ class ChangeNickModal(discord.ui.Modal, title="What's your new in-game name?"):
         await interaction.response.defer(ephemeral=True)
         new_name = self.new_name.value.strip()
         if not new_name:
-            await interaction.followup.send("❌ That can't be blank — run `/change-nick` again.", ephemeral=True)
+            await interaction.followup.send("❌ That can't be blank — run `/fix-me name` again.", ephemeral=True)
             return
         cleaned = strip_nickname_decorations(new_name) or new_name
 
         full_nickname = await apply_ingame_name_change(interaction.guild, self.member, cleaned)
-        reminder = await tf(NAME_CHANGE_REMINDER, interaction.user.id, abilities=abilities_mention(interaction.guild))
+        reminder = await tf(NAME_CHANGE_REMINDER, interaction.user.id)
         await interaction.followup.send(f"✅ Done — your display name is now **{full_nickname}**.\n\n{reminder}", ephemeral=True)
         await log_event(
             interaction.guild,
@@ -12163,7 +12485,6 @@ class ChangeNickReasonView(discord.ui.View):
         await interaction.response.send_modal(ChangeNickModal(self.member, "typo/registration correction"))
 
 
-@bot.tree.command(name="change-nick", description="Update your in-game name if it changed, or fix a typo — keeps your alliance tag/server tag intact.")
 async def change_nick_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
@@ -12224,7 +12545,7 @@ class FixTagModal(discord.ui.Modal, title="Which alliance are you actually in?")
             if r5_role and r5_role in self.member.roles:
                 await interaction.followup.send(
                     f"👑 You're the **R5 of [{current_tag}]**. Two different things you might mean:\n"
-                    f"• The alliance's *tag itself* is wrong → use `/rename-tag {current_tag} {new_tag}` (keeps you R5, moves everyone).\n"
+                    f"• The alliance's *tag itself* is wrong → use `/alliance rename tag:{current_tag} new_tag:{new_tag}` (keeps you R5, moves everyone).\n"
                     f"• You personally are *moving* to [{new_tag}] → confirm below. **You'd become a regular Member there** and [{current_tag}] would lose its R5.",
                     view=ConfirmTagSwitchView(self.member, current_tag, new_tag), ephemeral=True
                 )
@@ -12330,7 +12651,6 @@ class FixMeView(discord.ui.View):
         )
 
 
-@bot.tree.command(name="fix-me", description="Registered with the wrong name, tag, or server? Fix it yourself here — or get a human.")
 async def fix_me_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
@@ -12382,10 +12702,6 @@ class ConfirmDissolveView(discord.ui.View):
         await interaction.response.edit_message(content="👍 Nothing touched.", view=self)
 
 
-@bot.tree.command(name="dissolve-alliance", description="Delete an alliance entirely — roles, channels, and records. Typo cleanup. Asks first.")
-@app_commands.describe(tag="The alliance tag to remove")
-@app_commands.default_permissions(manage_channels=True)
-@is_senior_staff()
 async def dissolve_alliance_cmd(interaction: discord.Interaction, tag: str):
     tag = normalize_alliance_key(tag)
     guild = interaction.guild
@@ -12585,7 +12901,7 @@ async def announce_monthly_champions(guild):
     matching how this was asked for (one prize concept, alongside a tier
     structure)."""
     standings = await compute_monthly_champion_standings(guild)
-    general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+    general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
 
     if not standings:
         if general_ch:
@@ -12687,7 +13003,42 @@ async def build_rap_sheet(user_id: int) -> str:
     return "\n".join(lines)[:1024]
 
 
-@bot.tree.command(name="abilities", description="Get a verbose, cheeky rundown of everything you can do with Robo right now.")
+@bot.tree.command(name="safety", description="Is this bot legit? What it keeps, what it never asks for, and where to read its code.")
+@app_commands.describe(post_here="Staff only: post it publicly in this channel and pin it, instead of just showing you.")
+async def safety(interaction: discord.Interaction, post_here: bool = False):
+    await interaction.response.defer(ephemeral=not post_here)
+    try:
+        if post_here:
+            if not (isinstance(interaction.user, discord.Member) and is_staff_member(interaction.user)):
+                await interaction.followup.send(
+                    "🚔 Nice try, rookie — only staff can pin this for everyone. Here's your private copy instead:\n\n"
+                    + await tf(SAFETY_NOTE, interaction.user.id, url=PUBLIC_CODE_URL),
+                    ephemeral=True
+                )
+                return
+            # Public copy stays in English: the channel is shared by every language.
+            await interaction.followup.send("📌 Pinning the safety notice. Serve and protect! 🤖")
+            msg = await interaction.channel.send(SAFETY_NOTE.format(url=PUBLIC_CODE_URL))
+            try:
+                await msg.pin(reason=f"/safety posted by {interaction.user}")
+            except discord.HTTPException:
+                await interaction.followup.send(
+                    "⚠️ Posted it, but I couldn't pin it — I need **Manage Messages** in this channel. "
+                    "A human can pin it by hand in the meantime.", ephemeral=True)
+            await log_event(interaction.guild, f"🛡️ **SAFETY NOTICE POSTED**\n{interaction.user.mention} posted and pinned it in {interaction.channel.mention}.")
+            return
+
+        uid = interaction.user.id
+        text = await tf(SAFETY_NOTE, uid, url=PUBLIC_CODE_URL) + "\n\n" + await t(PRIVACY_NOTE, uid)
+        await send_long(interaction.followup, text, ephemeral=True)
+    except Exception as e:
+        ask = await report_error(interaction.guild, "/safety", interaction.user, e)
+        try:
+            await interaction.followup.send(f"{random.choice(CLIENT_ERROR_FLAVOR)}\n\n{ask}", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+
 async def abilities(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
@@ -12845,14 +13196,6 @@ async def _resolve_r5_grant_target(interaction: discord.Interaction, member: dis
     return my_tag if target_tag == my_tag else None
 
 
-@bot.tree.command(name="grant-rank", description="Directly assign R4 or R5 to a specific member. Dictator/Senator only.")
-@app_commands.describe(member="Who to assign a rank to", tag="Alliance tag (leave blank if there's only one)", rank="R4 or R5")
-@app_commands.choices(rank=[
-    app_commands.Choice(name="R4", value="R4"),
-    app_commands.Choice(name="R5", value="R5"),
-])
-@app_commands.default_permissions(manage_channels=True)
-@is_senior_staff()
 async def grant_rank_cmd(interaction: discord.Interaction, member: discord.Member, rank: str, tag: str = None):
     await interaction.response.defer(ephemeral=True)
     tag = normalize_alliance_key(tag) if tag else tag
@@ -13069,13 +13412,13 @@ class ConfirmTagMergeView(discord.ui.View):
         except Exception as e:
             ask = await report_error(guild, f"alliance merge [{self.old_tag}] → [{self.new_tag}]", interaction.user, e)
             await interaction.edit_original_response(
-                content=(f"❌ The merge hit a snag partway: `{type(e).__name__}`. Running `/rename-tag {self.old_tag} {self.new_tag}` "
+                content=(f"❌ The merge hit a snag partway: `{type(e).__name__}`. Running `/alliance rename tag:{self.old_tag} new_tag:{self.new_tag}` "
                          f"again picks up where it left off.\n\n{ask}"),
                 view=self
             )
             return
 
-        general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+        general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
         if general_ch:
             try:
                 await general_ch.send(embed=discord.Embed(
@@ -13119,8 +13462,6 @@ class ConfirmTagMergeView(discord.ui.View):
         await interaction.response.edit_message(content="👍 Stood down. Nothing touched — both alliances live to fight another day.", view=self)
 
 
-@bot.tree.command(name="rename-tag", description="Rename an alliance's tag — updates its roles, channels, and every member's record.")
-@app_commands.describe(old_tag="The alliance's current tag", new_tag="The new tag (2-4 letters)")
 async def rename_tag(interaction: discord.Interaction, old_tag: str, new_tag: str):
     """Open to everyone by decorator (no clean way to gate a slash command on
     'R5 of whichever tag you typed in a parameter' ahead of time), but the
@@ -13180,7 +13521,7 @@ async def rename_tag(interaction: discord.Interaction, old_tag: str, new_tag: st
             await interaction.followup.send(
                 f"🛑 Whoa there, Chief — **[{new_tag}]** already exists, so renaming **[{old_tag}]** to it would *merge* "
                 f"two whole alliances. That's above my pay grade *and* yours. 😅\n"
-                f"Ask an admin to run `/rename-tag {old_tag} {new_tag}` — they get the big red button.",
+                f"Ask an admin to run `/alliance rename tag:{old_tag} new_tag:{new_tag}` — they get the big red button.",
                 ephemeral=True
             )
             await log_event(
@@ -13235,7 +13576,7 @@ async def rename_tag(interaction: discord.Interaction, old_tag: str, new_tag: st
         await cur.execute("UPDATE rank_requests SET tag = ? WHERE tag = ?", (new_tag, old_tag))
         await conn.commit()
 
-    general_ch = discord.utils.get(guild.channels, name="💬-general-chat")
+    general_ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
     if general_ch:
         try:
             await general_ch.send(embed=discord.Embed(
@@ -13259,10 +13600,6 @@ async def rename_tag(interaction: discord.Interaction, old_tag: str, new_tag: st
     )
 
 
-@bot.tree.command(name="grant-rank-picker", description="Click a username from a live server search and assign R4/R5 on the spot.")
-@app_commands.describe(tag="Alliance tag (leave blank if there's only one)")
-@app_commands.default_permissions(manage_channels=True)
-@is_senior_staff()
 async def grant_rank_picker_cmd(interaction: discord.Interaction, tag: str = None):
     tag = normalize_alliance_key(tag) if tag else tag
     if not tag:
@@ -13289,8 +13626,6 @@ async def grant_rank_picker_cmd(interaction: discord.Interaction, tag: str = Non
 
 
 
-@bot.tree.command(name="grant-leadership", description="R5-only: quietly trust someone with leadership-chat access, no formal rank needed.")
-@app_commands.describe(member="Who to grant leadership-chat access to")
 async def grant_leadership_cmd(interaction: discord.Interaction, member: discord.Member):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
@@ -13314,8 +13649,6 @@ async def grant_leadership_cmd(interaction: discord.Interaction, member: discord
         pass
 
 
-@bot.tree.command(name="revoke-leadership", description="R5-only: remove someone's standalone leadership-chat access.")
-@app_commands.describe(member="Who to remove leadership-chat access from")
 async def revoke_leadership_cmd(interaction: discord.Interaction, member: discord.Member):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
@@ -13387,110 +13720,628 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         pass
 
 
-@bot.tree.command(name="robocop", description="Robocop master command directory.")
-@app_commands.default_permissions(kick_members=True)
-@is_staff()
-async def robocop_help(interaction: discord.Interaction, query: str = None):
-    help_text = (
-        "🤖 **ROBOCOP ADMINISTRATIVE COMMAND DIRECTORY** 🤖\n\n"
-        "🚨 **ADOPTING AN EXISTING (NON-FRESH) SERVER? START HERE.** 🚨\n"
-        "The startup diagnostic in **#logs** carries buttons for exactly this — no typing required, "
-        "which matters since a mistyped slash command silently does nothing. In order:\n"
-        "1️⃣ **🚔 Convert Everyone + Migrate Ranks (PTD/21)** — registers everyone, fixes nicknames, AND maps "
-        "old R2-R5/Admin roles into the new system, all in one click\n"
-        "2️⃣ Hand-assign any special identities (Chrome, Silent, etc.) — deliberately manual, always\n"
-        "3️⃣ `/announce-update` — tells everyone, once you're happy with how it looks\n"
-        "Don't see those buttons? They repost at every startup until resolved — just restart the bot. "
-        "Prefer typed commands instead? `/ptd-upgrade-now` and `/ptd-reset` do the same first two steps — "
-        "but a command that silently fails to register as an actual interaction looks identical to nothing "
-        "happening at all, so the buttons are the safer bet.\n\n"
-        "**Rank Structure**\n"
-        "• 👑 **DICTATOR** — the owner. Full Administrator, no restrictions, always.\n"
-        "• 🟠 **SENATOR** — everything a Judge can do, plus creating/deleting channels.\n"
-        "• 🔨 **JUDGE** — moderator: kick, ban, timeout, imprison, nicknames, voice-move, audit log. No channel/role/server management.\n\n"
-        "**Dictator-Only**\n"
-        "• `/database-tools` — posts a #logs panel to release current prisoners or permanently reset the users database (with a confirmation step).\n"
-        "• `/restore-innovators` — Re-grants the Innovator badge to everyone recorded in the database, in case roles ever got reset.\n"
-        "• `/grant-innovator-all` — One-time bulk grant for a server adoption/transition: everyone currently present, bypassing the usual caps.\n"
-        "• `/adopt-alliance <tag>` — Adopt an existing, already-populated server's channels/roles into our structure, one confirmed step at a time.\n"
-        "• `/migrate-legacy-roles` — Scan for old rank/admin roles from before this bot and map them into the new system, one at a time.\n"
-        "• `/bulk-onboard-existing <tag> <servers>` — Register everyone already in the server, assuming one known alliance. For adopting a single-alliance server only.\n"
-        "• `/ptd-upgrade-now` — One-shot typed version of the adoption button above, specific to this server (PTD, server 21).\n"
-        "• `/ptd-reset` — Clears PTD's alliance registration for a clean retry, without touching channels/roles/people.\n"
-        "• `/announce-update` — Manually fire the 'system update in progress' announcement + brief lockdown, without waiting for a detected live handoff.\n\n"
-        "**Moderation** *(Judge and above)*\n"
-        "• `/approve-tag <tag>` — Unlocks quarantined alliance & removes Drunk Tank.\n"
-        "• `/warn <member> <reason>` — Issues a formal warning (DMs the member, logs it).\n"
-        "• `/warnings <member>` — Lists a member's warning history.\n"
-        "• `/imprison <nickname> <minutes>` — Locks user in solitary (strips overriding roles).\n"
-        "• `/unban <user_id>` — Lifts Discord ban and resets database infractions.\n"
-        "• `/pardon <user_id>` — Clears active timeouts, resets fails, and releases prisoners.\n"
-        "• `/show-banned` — Displays all permanently banned users & infraction logs.\n"
-        "• `/re-check-nicknames` — Compares nicknames against actual current roles and offers one-click fixes for each mismatch, in #logs.\n"
-        "• `/enforce-registration <member>` — Flags an existing member for mandatory registration right now, instead of waiting for them to run /register.\n"
-        "• `/killswitch [minutes] [off]` — Emergency lockdown pausing chat.\n"
-        "• Every ban/kick/imprison posted to #logs carries an **Undo** button — no need to remember commands.\n\n"
-        "**Alliances & Server Setup** *(Senator and above)*\n"
-        "• `/stop-alliance <lock>` — Master kill switch freezing all new alliance creation.\n"
-        "• `/release-timekeeper` — Opens 10-minute burst window.\n"
-        "• `/add-request-role <role> <description>` — Adds custom role option to database.\n"
-        "• `/configure-servers <list>` — Sets which Police Chief servers this community supports (e.g. `21,121` or `10-15`). Live, no restart needed.\n"
-        "• `/toggle-innovator-program` — Turns future automatic Innovator badge grants on or off.\n"
-        "• `/toggle-rogue-bot-program` — Turns the automatic Rogue RoboCop round on or off, useful to suppress during a migration.\n"
-        "• `/set-monthly-prize [prize]` — Sets what next month's #1 Monthly Champion (Gold) wins. Leave blank to reset to the default (bragging rights).\n"
-        "• `/dissolve-alliance <tag>` — Removes an alliance entirely: roles, both categories and their channels, DB rows. For typo-alliances. Confirms first; also offered as a one-click button in #logs whenever an alliance empties out.\n\n"
-        "**Data / Audit** *(Judge and above)*\n"
-        "• `/show-role <role>` — Ephemeral admin audit listing members for a target role.\n"
-        "• `/show-db-fields <member>` — Lists all fields and values for a specific user.\n"
-        "• `/show-field <field>` — Lists all users sorted by a specific database field.\n"
-        "• `/server-stats` — Translations served, referral counts, RPS win/loss records, and more.\n"
-        "• `/start-chase` / `/end-chase` — Manually trigger or cut short a Cops & Robbers round (auto-runs daily at noon PST).\n"
-        "• `/game-start`, `/game-end`, `/game-restart` — Unified control for BOTH round games (Cops & Robbers, Rogue RoboCop): "
-        "start now or in N minutes, end now or pause-and-auto-resume in N minutes, or restart. Either game also auto-ends "
-        f"itself if nobody makes a real move for {GAME_INACTIVITY_TIMEOUT_SECONDS // 60} minutes straight.\n"
-        "• `/rename-tag <old> <new>` — Rename any alliance's tag; updates its roles, channels, and every member's record. "
-        "(An alliance's own R5 can also do this for their own tag, no staff needed. Renaming onto a tag that already exists merges the two — admin only, with an are-you-sure step.)\n"
-        "• `/monthly-champions-now` — Manually fire the Monthly Champion announcement (gold/silver/bronze) and reset standings, without waiting for the 1st.\n\n"
-        "**Open to everyone**\n"
-        "• `/language` — Change which language I use when talking to you, any time after onboarding too.\n"
-        "• `/timezone` — Set or change your approximate time zone, so I can tell you how the server's schedule lines up with yours.\n"
-        "• `/nickname` — If your in-game name differs across servers you play on, manage per-server nicknames and switch your active display name any time.\n"
-        "• `/change-nick` — One-step name update: asks whether it's an actual in-game name change or just a typo, then updates only the base name, leaving `[TAG] (servers)` untouched.\n"
-        "• `/fix-me` — Self-service correction panel: wrong name / wrong tag / wrong server, each a button, plus 'get me a human'. Switching tag moves them to an existing alliance (never founds one) and flags the old one in #logs if it's now empty.\n"
-        "• `/announce <message>` — Scope depends on rank: members reach the current channel (1/hr), an alliance's R5 reaches all of that alliance's channels (1/30min), staff reach the whole server (no limit).\n"
-        "• `/register` (in #gateway) — For members who were already in the server before I was added, or never finished onboarding.\n"
-        "• `/abilities` — cheeky, verbose rundown of exactly what YOU can do right now (also in #❓-abilities).\n"
-        "• `/request-rank` (used in #⚙️-role-requests) — Requests R4/R5 in your alliance. Staff or your R5 rule on it from #logs.\n"
-        "• `/grant-leadership` / `/revoke-leadership` (R5-only) — Directly trust someone with leadership-chat access, no formal rank or approval needed.\n"
-        "• `/rps [opponent]` — Rock, Paper, Scissors vs another Chief or Robocop.\n"
-        "• `/alliance-leaderboard` — Ranks alliances by member count.\n"
-        "• `/arrest <name>` / `/ambush <name>` — Cops & Robbers moves, only usable if you're actually in the current round.\n"
-        "• `/chase-status`, `/leave-chase`, `/join-chase` — Check your status, or opt in/out of future rounds.\n"
-        "• `/catch <name>` — Guess a hiding Rogue RoboCop's secret identity (triggered by version updates, not scheduled).\n"
-        "• `/game-stats` — Running server-wide totals for RPS, Cops & Robbers, and Rogue RoboCop. Also auto-posts to "
-        "#general-chat once a day (default midnight local time, adjustable via `/configure-setting game_stats_hour`).\n"
-        "• `/monthly-standings` — Live gold/silver/bronze race for the current month, on demand, without resetting anything.\n\n"
-        "**Housekeeping**\n"
-        "• ✨ There is exactly one **Millie** in this server, always exactly this pink, and she carries full JUDGE-level moderator permissions.\n"
-        "• 🧵 There is exactly one **Stitch**, always exactly this purple, and they carry full JUDGE-level moderator permissions.\n"
-        "• Every startup and every time I rejoin this server, I post a diagnostic to #logs — and if something's actually wrong "
-        "(not just different from default), you'll know because sirens.\n"
-        "• I also audit the whole member list on startup — anyone not registered gets a one-time DM pointing them at `/register`. Anyone who *joined while I was offline* (last 3 days, never started registering) gets the full #gateway onboarding started for them automatically instead.\n"
-        "• 🚪 **#visitors** logs every join and leave, including why someone left when I can tell (kicked, banned, or just left on their own).\n"
-        "• 🆕 **#latest-version** only posts when a startup after an update finds something inconsistent — quiet otherwise.\n"
-        f"• 🗑️ A Cops & Robbers or Rogue RoboCop round with zero real engagement for {GAME_INACTIVITY_TIMEOUT_SECONDS // 60} straight "
-        "minutes auto-voids: the announcement gets deleted, nobody's stats move, and it won't recount toward `/game-stats`. It also "
-        "won't force an early restart — the next automatic round still waits for its normal scheduled time.\n"
-        "• 🗂️ **Every startup I inventory the live server** — alliance roles/categories, members' tag/server/rank roles, nicknames, Innovator badges — and rebuild any database record that's missing from it. Wipe the database and it regenerates itself on the next boot; nobody re-registers. Then I check every alliance member's nickname against their roles and fix mismatches on the spot. Both passes log everything to #logs.\n"
-        "• 🆘 Anyone who types `help` at any #gateway prompt gets staff pinged (once) and is never penalized for it. Three unusable tag or server answers now **park them and call a human** instead of banning.\n"
-        "• 📅 On the 1st of every month, I announce the **Monthly Champion** — gold/silver/bronze, scored the same way "
-        "`/leaderboard` already scores everything, just measured from the start of the month instead of all-time. Gold wins "
-        "whatever `/set-monthly-prize` is currently set to (default: bragging rights); standings reset right after the announcement.\n"
-        "• 🔄 When a new version of me takes over from an old one, I announce it in every community channel and pause chat for "
-        f"{VERSION_HANDOFF_LOCKDOWN_SECONDS} seconds during the handoff, then reopen automatically.\n"
-        "• 🚨 Genuinely serious findings (security dangers, an onboarding crash) also go straight to the server owner's DMs, not just #logs."
+
+
+# ============================================================
+#  10.0 — GROUPED COMMANDS
+#  66 commands became 28. Everything that used to be its own slash command
+#  is now an option on a shorter list, and every option is described in
+#  full as you type. The rules that make them foolproof:
+#    • Read-only lookups just run — leaving an option blank picks the
+#      obvious default and the reply says which.
+#    • Anything that CHANGES something and was left half-specified says
+#      what it's about to do and asks first ("You didn't give a time, so
+#      I'll start it right now — go ahead?").
+#    • Anything destructive always asks, no matter how it was typed.
+#    • A tag that doesn't exist gets a "did you mean [PTD]?" instead of an
+#      error.
+#  The original implementations survive unchanged as plain helper
+#  functions above; the commands below only decide what to call.
+# ============================================================
+_RANK_DENIED = {
+    "staff": "🚫 That one needs a Judge badge or higher, Chief. Ask a moderator.",
+    "senior": "🚫 That one's Senator-and-up only — it can change the shape of the server. Ask Mesk or a Senator.",
+    "dictator": "🚫 Dictator only. Only the owner can pull that lever.",
+}
+
+
+async def _has_rank(interaction: discord.Interaction, level: str) -> bool:
+    """Replies with a friendly 'not your badge' line and returns False if the
+    person can't run this option. Grouped commands mix tiers (one option is
+    for Judges, the next for Senators), so the check lives per option."""
+    m = interaction.user
+    ok = isinstance(m, discord.Member) and (
+        (level == "staff" and is_staff_member(m))
+        or (level == "senior" and is_senior_staff_member(m))
+        or (level == "dictator" and is_dictator_member(m))
     )
-    await interaction.response.send_message(help_text, ephemeral=True)
+    if not ok:
+        await _reply(interaction, _RANK_DENIED[level])
+    return ok
+
+
+async def _reply(interaction: discord.Interaction, content: str, **kwargs):
+    """Sends an ephemeral reply whether or not this interaction has been
+    answered yet — the one thing every branch below needs."""
+    try:
+        if interaction.response.is_done():
+            return await interaction.followup.send(content, ephemeral=True, **kwargs)
+        return await interaction.response.send_message(content, ephemeral=True, **kwargs)
+    except discord.HTTPException:
+        return None
+
+
+class ConfirmView(discord.ui.View):
+    """Yes / Cancel. The Yes button hands the caller a FRESH interaction, so
+    the helper it runs can answer normally (defer, send_message...) without
+    tripping over the confirmation prompt's own reply."""
+
+    def __init__(self, user, on_yes, yes_label="Yes, do it", danger=False):
+        super().__init__(timeout=90.0)
+        self.user = user
+        self.on_yes = on_yes
+        self.done = False
+        self.yes.label = yes_label
+        self.yes.style = discord.ButtonStyle.danger if danger else discord.ButtonStyle.success
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("🚔 Not your button, Chief.", ephemeral=True)
+            return False
+        return True
+
+    async def _finish(self, interaction: discord.Interaction, text: str):
+        self.done = True
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.response.edit_message(content=text, view=self)
+        except discord.HTTPException:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="Yes, do it", style=discord.ButtonStyle.success, emoji="✅")
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.done:
+            await interaction.response.send_message("ℹ️ Already handled — no double-dipping, Chief.", ephemeral=True)
+            return
+        if await busy_reject_component(interaction):
+            return
+        self.done = True
+        for item in self.children:
+            item.disabled = True
+        self.stop()
+        try:
+            await self.on_yes(interaction)
+        except Exception as e:
+            await handle_interaction_error(interaction, e, f"confirmed action in /{getattr(getattr(interaction, 'command', None), 'name', '?')}")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="✋")
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, "✋ Cancelled — nothing was changed.")
+
+    async def on_timeout(self):
+        if not self.done:
+            for item in self.children:
+                item.disabled = True
+
+
+async def _confirm(interaction: discord.Interaction, question: str, on_yes, yes_label="Yes, do it", danger=False):
+    """Ask before acting. `on_yes(fresh_interaction)` runs only on Yes."""
+    view = ConfirmView(interaction.user, on_yes, yes_label=yes_label, danger=danger)
+    await _reply(interaction, question, view=view)
+
+
+async def _known_alliance_keys() -> list:
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        await cur.execute("SELECT tag FROM alliances ORDER BY tag")
+        return [r[0] for r in await cur.fetchall()]
+
+
+async def _resolve_tag(interaction: discord.Interaction, raw, then, must_exist=True) -> None:
+    """(Deliberately no defer here: a single indexed SELECT, and the helper
+    that follows may need to answer the original interaction itself.)
+    Turns whatever was typed into a real alliance key and calls
+    `then(fresh_or_same_interaction, key)`. Unknown tag → 'did you mean?'
+    buttons (up to 3 close matches) instead of a dead-end error. Missing
+    tag → lists the alliances to pick from."""
+    keys = await _known_alliance_keys()
+    if not raw or not str(raw).strip():
+        listing = ", ".join(f"`{tag_display(k)}`" + (f" ({tag_home_server(k)})" if tag_home_server(k) else "") for k in keys) or "(none registered yet)"
+        await _reply(interaction, f"🏷️ You didn't say which alliance. Run it again with the **tag** option — one of: {listing}")
+        return
+    key = normalize_alliance_key(str(raw))
+    if not must_exist or key in keys:
+        await then(interaction, key)
+        return
+    # Plain tag typed for a server-scoped alliance, or a typo.
+    plain = [k for k in keys if tag_display(k) == tag_display(key)]
+    if len(plain) == 1:
+        await then(interaction, plain[0])
+        return
+    scored = sorted(keys, key=lambda k: -SequenceMatcher(None, tag_display(k), tag_display(key)).ratio())
+    close = [k for k in scored[:3] if SequenceMatcher(None, tag_display(k), tag_display(key)).ratio() >= 0.5]
+    if not close:
+        await _reply(interaction, f"❓ I don't know an alliance called **[{tag_display(key)}]**. Registered: " + (", ".join(f"`{tag_display(k)}`" for k in keys) or "none yet"))
+        return
+
+    view = discord.ui.View(timeout=60.0)
+    for k in close:
+        btn = discord.ui.Button(label=f"[{tag_display(k)}]" + (f" · server {tag_home_server(k)}" if tag_home_server(k) else ""), style=discord.ButtonStyle.primary)
+
+        async def cb(i: discord.Interaction, key=k):
+            if i.user.id != interaction.user.id:
+                await i.response.send_message("🚔 Not your button, Chief.", ephemeral=True)
+                return
+            for item in view.children:
+                item.disabled = True
+            view.stop()
+            await then(i, key)
+        btn.callback = cb
+        view.add_item(btn)
+    await _reply(interaction, f"🤔 No alliance called **[{tag_display(key)}]** — did you mean one of these?", view=view)
+
+
+class _Pick:
+    """Stand-in for an app_commands.Choice when a helper expects one."""
+    def __init__(self, name, value):
+        self.name, self.value = name, value
+
+
+_GAME_NAMES = {"chase": "Cops & Robbers", "rogue": "Rogue RoboCop"}
+
+
+# ---------------------------------------------------------------- /game
+@bot.tree.command(name="game", description="Staff: start, end or restart Cops & Robbers / Rogue RoboCop. Asks before doing anything.")
+@app_commands.describe(
+    action="What to do: start a round, end the current one, or end-and-start-fresh.",
+    game="Which game. Cops & Robbers is the daily manhunt; Rogue RoboCop is the hide-and-seek.",
+    minutes="Optional. start: delay by this many minutes. end: auto-restart after this many. Blank = now / none.",
+)
+@app_commands.choices(
+    action=[app_commands.Choice(name="start — begin a round", value="start"),
+            app_commands.Choice(name="end — stop the current round", value="end"),
+            app_commands.Choice(name="restart — end it and start a fresh one", value="restart")],
+    game=GAME_CHOICES,
+)
+@app_commands.default_permissions(kick_members=True)
+async def game_cmd(interaction: discord.Interaction, action: str, game: str, minutes: Optional[int] = None):
+    if not await _has_rank(interaction, "staff"):
+        return
+    pick = _Pick(_GAME_NAMES[game], game)
+    if minutes is not None and minutes < 0:
+        await _reply(interaction, "⏱️ Minutes can't be negative — I'm good, but not time-travel good.")
+        return
+    if action == "start":
+        if minutes:
+            await game_start(interaction, pick, minutes)
+            return
+        await _confirm(interaction,
+                       f"🕹️ You didn't give a delay, so I'll start **{pick.name}** **right now** and announce it to everyone. Go ahead?",
+                       lambda i: game_start(i, pick, None), yes_label="Start now")
+    elif action == "end":
+        note = f"and automatically start a fresh one in **{minutes} minute(s)**" if minutes else "and **not** start another one automatically (leave `minutes` blank = no auto-restart)"
+        await _confirm(interaction, f"🛑 I'll end the current **{pick.name}** round now, {note}. Go ahead?",
+                       lambda i: game_end(i, pick, minutes or None), yes_label="End it", danger=True)
+    else:
+        await _confirm(interaction, f"🔄 I'll end the current **{pick.name}** round (if any) and immediately start a fresh one. Go ahead?",
+                       lambda i: game_restart(i, pick), yes_label="Restart")
+
+
+# ---------------------------------------------------------------- /chase
+@bot.tree.command(name="chase", description="Cops & Robbers: check if you're in this round, or opt out of / back into future rounds.")
+@app_commands.describe(action="Blank = status. 'leave' skips you in future rounds; 'join' puts you back in.")
+@app_commands.choices(action=[
+    app_commands.Choice(name="status — am I in the current round? (default)", value="status"),
+    app_commands.Choice(name="leave — don't include me in future rounds", value="leave"),
+    app_commands.Choice(name="join — include me again", value="join"),
+])
+async def chase_cmd(interaction: discord.Interaction, action: str = "status"):
+    if action == "join":
+        await join_chase(interaction)
+    elif action == "leave":
+        await _confirm(interaction, "🙈 You'll be left out of every future Cops & Robbers round until you run `/chase join`. Sure?",
+                       leave_chase, yes_label="Leave me out")
+    else:
+        await chase_status(interaction)
+
+
+# ---------------------------------------------------------------- /stats
+@bot.tree.command(name="stats", description="Scores and standings: yours, the top 10, this month's race, game totals, or alliances by size.")
+@app_commands.describe(view="Blank = your own record.")
+@app_commands.choices(view=[
+    app_commands.Choice(name="me — my record and rank (default)", value="me"),
+    app_commands.Choice(name="top10 — the server's all-time top 10", value="top10"),
+    app_commands.Choice(name="monthly — this month's gold/silver/bronze race", value="monthly"),
+    app_commands.Choice(name="games — server-wide totals for all three games", value="games"),
+    app_commands.Choice(name="alliances — alliances ranked by member count", value="alliances"),
+])
+async def stats_grouped(interaction: discord.Interaction, view: str = "me"):
+    await {"top10": leaderboard_cmd, "monthly": monthly_standings_cmd, "games": game_stats,
+           "alliances": alliance_leaderboard}.get(view, stats_cmd)(interaction)
+
+
+# ---------------------------------------------------------------- /fix-me
+@bot.tree.command(name="fix-me", description="Wrong name, tag or server on file? Fix it yourself — buttons for each, or summon a human.")
+@app_commands.describe(what="Blank = a menu showing what I have on file, with a button for each thing you can fix.")
+@app_commands.choices(what=[
+    app_commands.Choice(name="menu — show my record and pick what to fix (default)", value="menu"),
+    app_commands.Choice(name="name — my in-game name changed / has a typo", value="name"),
+    app_commands.Choice(name="nicknames — I use different names on different servers", value="nicknames"),
+])
+async def fix_me_grouped(interaction: discord.Interaction, what: str = "menu"):
+    if what == "name":
+        await change_nick_cmd(interaction)
+    elif what == "nicknames":
+        await nickname_cmd(interaction)
+    else:
+        await fix_me_cmd(interaction)
+
+
+# ---------------------------------------------------------------- /help
+@bot.tree.command(name="help", description="Your personal rundown of everything you can do here, plus the command list.")
+@app_commands.describe(everything="True = list every command on the server, including staff ones you can't run. Blank = just yours.")
+async def help_cmd(interaction: discord.Interaction, everything: bool = False):
+    if not interaction.guild:
+        await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
+        return
+    await abilities(interaction)  # the personnel-file embed (responds itself)
+    chunks = build_public_command_reference(verbose=False, for_member=None if everything else interaction.user)
+    for chunk in chunks:
+        try:
+            await interaction.followup.send(chunk, ephemeral=True)
+        except discord.HTTPException:
+            break
+
+
+# ---------------------------------------------------------------- /leadership
+@bot.tree.command(name="leadership", description="R5 only: give or take away leadership-chat access, without changing anyone's rank.")
+@app_commands.describe(action="grant = let them into 🎖️-leadership-chat; revoke = remove that access.", member="Who.")
+@app_commands.choices(action=[
+    app_commands.Choice(name="grant — give leadership-chat access", value="grant"),
+    app_commands.Choice(name="revoke — remove leadership-chat access", value="revoke"),
+])
+async def leadership_cmd(interaction: discord.Interaction, action: str, member: discord.Member):
+    if action == "revoke":
+        await _confirm(interaction, f"🔒 Remove {member.mention}'s leadership-chat access? (Their rank, if any, stays as it is.)",
+                       lambda i: revoke_leadership_cmd(i, member), yes_label="Revoke", danger=True)
+    else:
+        await grant_leadership_cmd(interaction, member)
+
+
+# ---------------------------------------------------------------- /grant-rank
+@bot.tree.command(name="grant-rank", description="Senator+: give someone R4 or R5 directly. Leave member blank to pick from a live search.")
+@app_commands.describe(
+    member="Who gets the rank. Blank = I'll show you a searchable picker instead.",
+    rank="R4 (officer) or R5 (command). Blank = I'll ask.",
+    tag="Their alliance. Blank is fine if there's only one. Same tag on two servers? Type e.g. HAL-121.",
+)
+@app_commands.choices(rank=[app_commands.Choice(name="R4 — officer", value="R4"), app_commands.Choice(name="R5 — command", value="R5")])
+@app_commands.default_permissions(manage_channels=True)
+async def grant_rank_grouped(interaction: discord.Interaction, member: Optional[discord.Member] = None, rank: Optional[str] = None, tag: Optional[str] = None):
+    if not await _has_rank(interaction, "senior"):
+        return
+
+    async def go(i, key):
+        if member is None:
+            await grant_rank_picker_cmd(i, key)
+            return
+        if rank is None:
+            view = discord.ui.View(timeout=60.0)
+            for r in ("R4", "R5"):
+                b = discord.ui.Button(label=f"Make them {r}", style=discord.ButtonStyle.primary)
+
+                async def cb(ii: discord.Interaction, r=r):
+                    if ii.user.id != interaction.user.id:
+                        await ii.response.send_message("🚔 Not your button, Chief.", ephemeral=True)
+                        return
+                    view.stop()
+                    await grant_rank_cmd(ii, member, r, key)
+                b.callback = cb
+                view.add_item(b)
+            await _reply(i, f"🎖️ You didn't say which rank for {member.mention}. Which one?", view=view)
+            return
+        await grant_rank_cmd(i, member, rank, key)
+
+    if tag:
+        await _resolve_tag(interaction, tag, go)
+    else:
+        await go(interaction, None)
+
+
+# ---------------------------------------------------------------- /alliance
+@bot.tree.command(name="alliance", description="Staff: approve, rename or dissolve an alliance; lock/unlock new ones; open a 10-min burst window.")
+@app_commands.describe(
+    action="What to do. approve/rename/dissolve need `tag`; rename also needs `new_tag`.",
+    tag="The alliance (2–4 letters). Same tag on two servers? Type e.g. HAL-121.",
+    new_tag="rename only: the new 2–4 letter tag. Renaming onto an existing tag MERGES the two (admin only).",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="approve — release a new alliance from the Drunk Tank (Judge+)", value="approve"),
+    app_commands.Choice(name="rename — change an alliance's tag everywhere (its R5, or Judge+)", value="rename"),
+    app_commands.Choice(name="dissolve — delete an alliance completely (Senator+)", value="dissolve"),
+    app_commands.Choice(name="lock — freeze creation of new alliances (Senator+)", value="lock"),
+    app_commands.Choice(name="unlock — allow new alliances again (Senator+)", value="unlock"),
+    app_commands.Choice(name="burst — open a 10-minute window for several new alliances (Senator+)", value="burst"),
+])
+async def alliance_cmd(interaction: discord.Interaction, action: str, tag: Optional[str] = None, new_tag: Optional[str] = None):
+    if action == "approve":
+        if not await _has_rank(interaction, "staff"):
+            return
+        await _resolve_tag(interaction, tag, lambda i, key: approve_tag(i, key))
+    elif action == "rename":
+        if not new_tag or not (2 <= len(new_tag.strip()) <= 4 and new_tag.strip().isalpha()):
+            await _reply(interaction, "🏷️ Rename needs `new_tag` — 2 to 4 letters, e.g. `PTD`.")
+            return
+
+        async def go(i, key):
+            await _confirm(i, f"✏️ Rename **[{tag_display(key)}]** to **[{new_tag.strip().upper()}]** everywhere — roles, channels and every member's record? "
+                              f"(If [{new_tag.strip().upper()}] already exists, the two alliances will be **merged**.)",
+                           lambda ii: rename_tag(ii, key, new_tag.strip()), yes_label="Rename", danger=True)
+        await _resolve_tag(interaction, tag, go)
+    elif action == "dissolve":
+        if not await _has_rank(interaction, "senior"):
+            return
+        await _resolve_tag(interaction, tag, lambda i, key: dissolve_alliance_cmd(i, key))  # it asks for its own confirmation
+    elif action in ("lock", "unlock"):
+        if not await _has_rank(interaction, "senior"):
+            return
+        lock = action == "lock"
+        what = "**freeze** new alliance creation — newcomers with a new tag will be parked until it's unlocked" if lock else "**allow** new alliances again"
+        await _confirm(interaction, f"🔒 I'll {what}. Go ahead?", lambda i: stop_alliance(i, lock), yes_label="Lock" if lock else "Unlock", danger=lock)
+    elif action == "burst":
+        if not await _has_rank(interaction, "senior"):
+            return
+        await _confirm(interaction, "⏱️ Open a **10-minute window** where the one-new-alliance-at-a-time cooldown is suspended (up to 5 tags)? Go ahead?",
+                       release_timekeeper, yes_label="Open it")
+
+
+# ---------------------------------------------------------------- /pardon
+@bot.tree.command(name="pardon", description="Judge+: clear someone's slate — release prison/time-out, reset strikes, lift a ban if any.")
+@app_commands.describe(member="Pick them from the list (if they're still in the server).",
+                       user_id="Or paste their Discord ID (needed if they're banned or gone). Right-click → Copy User ID.")
+@app_commands.default_permissions(kick_members=True)
+async def pardon_grouped(interaction: discord.Interaction, member: Optional[discord.Member] = None, user_id: Optional[str] = None):
+    if not await _has_rank(interaction, "staff"):
+        return
+    await interaction.response.defer(ephemeral=True)  # the ban lookup is a Discord API call; the helper runs on the button's own interaction
+    raw = str(member.id) if member else (user_id or "").strip()
+    if not raw:
+        await _reply(interaction, "🙋 Who? Pick a `member`, or paste a `user_id` for someone who's banned or has left.")
+        return
+    if not raw.isdigit():
+        await _reply(interaction, "❌ That doesn't look like a Discord ID — it's a long number. Right-click the person → **Copy User ID**.")
+        return
+    uid = int(raw)
+    banned = False
+    try:
+        await interaction.guild.fetch_ban(discord.Object(id=uid))
+        banned = True
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+    who = member.mention if member else f"`{uid}`"
+    if banned:
+        await _confirm(interaction, f"🕊️ {who} is **banned**. Lift the ban and clear all their infractions so they can rejoin?",
+                       lambda i: unban_user(i, raw), yes_label="Unban")
+    else:
+        await _confirm(interaction, f"🕊️ Pardon {who}: release them from prison/time-out (if they're in one) and clear their strikes?",
+                       lambda i: pardon(i, raw), yes_label="Pardon")
+
+
+# ---------------------------------------------------------------- /record
+@bot.tree.command(name="record", description="Judge+: one member's full file — registration details, warnings, and moderation history.")
+@app_commands.describe(member="Whose file to pull.")
+@app_commands.default_permissions(kick_members=True)
+async def record_cmd(interaction: discord.Interaction, member: discord.Member):
+    if not await _has_rank(interaction, "staff"):
+        return
+    await interaction.response.defer(ephemeral=True)
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        await cur.execute("SELECT user_id, original_username, in_game_name, alliance_tag, rank_designation, server_number, invite_strikes, "
+                          "lifetime_invite_fails, timeout_until, pref_lang, prison_until, pref_timezone FROM users WHERE user_id = ?", (member.id,))
+        row = await cur.fetchone()
+        await cur.execute("SELECT reason, timestamp FROM warnings WHERE user_id = ? ORDER BY timestamp DESC", (member.id,))
+        warns = await cur.fetchall()
+    out = f"📂 **File: {member.display_name}** ({member.mention}, `{member.id}`)\n"
+    if row:
+        labels = ["User ID", "Discord username at first sight", "In-game name", "Alliance", "Rank", "Server(s)", "Invite strikes",
+                  "Lifetime invite fails", "Timed out until", "Language", "In prison until", "Time zone"]
+        out += "\n".join(f"• **{l}:** {v if v is not None else '—'}" for l, v in zip(labels, row)) + "\n"
+    else:
+        out += "• No registration record — they've never been through #gateway.\n"
+    out += f"\n⚠️ **Warnings ({len(warns)}):**\n" + ("\n".join(f"• {t} — {r}" for r, t in warns) if warns else "• none")
+    out += "\n\n📋 **Moderation history:**\n" + await build_rap_sheet(member.id)
+    await send_long(interaction.followup, out, ephemeral=True)
+
+
+# ---------------------------------------------------------------- /lookup
+@bot.tree.command(name="lookup", description="Judge+: lists and numbers — banned users, who holds a role, everyone by a field, or usage stats.")
+@app_commands.describe(
+    what="Which list.",
+    role="'role' only: which role to list the members of.",
+    field="'field' only: which registration field to sort everyone by.",
+)
+@app_commands.choices(
+    what=[app_commands.Choice(name="banned — everyone permanently banned, with reasons", value="banned"),
+          app_commands.Choice(name="role — everyone holding a given role (needs `role`)", value="role"),
+          app_commands.Choice(name="field — everyone sorted by tag / server / rank / name (needs `field`)", value="field"),
+          app_commands.Choice(name="usage — translations, referrals, RPS totals and more", value="usage")],
+    field=[app_commands.Choice(name="Alliance tag", value="alliance_tag"),
+           app_commands.Choice(name="Server number", value="server_number"),
+           app_commands.Choice(name="Rank", value="rank_designation"),
+           app_commands.Choice(name="In-game name", value="in_game_name")],
+)
+@app_commands.default_permissions(kick_members=True)
+async def lookup_cmd(interaction: discord.Interaction, what: str, role: Optional[discord.Role] = None, field: Optional[str] = None):
+    if not await _has_rank(interaction, "staff"):
+        return
+    if what == "banned":
+        await show_banned(interaction)
+    elif what == "usage":
+        await server_stats(interaction)
+    elif what == "role":
+        if role is None:
+            await _reply(interaction, "🎭 Which role? Run it again with the `role` option filled in.")
+            return
+        await show_role(interaction, role)
+    else:
+        if field is None:
+            await _reply(interaction, "📇 Sort by what? Run it again with `field` set to tag, server, rank or name.")
+            return
+        await show_field(interaction, field)
+
+
+# ---------------------------------------------------------------- /settings
+_EXTRA_SETTINGS = {
+    "managed_servers": "Game servers this community supports (e.g. 21,121 or 10-15)",
+    "innovator_program": "Innovator badge for new registrants: on / off",
+    "rogue_bot_program": "Automatic Rogue RoboCop round after each update: on / off",
+    "monthly_prize": "What the Monthly Champion (gold) wins — blank resets to bragging rights",
+}
+_SETTING_CHOICES = [app_commands.Choice(name=meta["label"][:100], value=key) for key, meta in CONFIGURABLE_SETTINGS.items()] + \
+                   [app_commands.Choice(name=label[:100], value=key) for key, label in _EXTRA_SETTINGS.items()]
+
+
+def _parse_on_off(value: str):
+    v = (value or "").strip().lower()
+    if v in ("on", "true", "yes", "1", "enable", "enabled"):
+        return True
+    if v in ("off", "false", "no", "0", "disable", "disabled"):
+        return False
+    return None
+
+
+@bot.tree.command(name="settings", description="Senator+: view or change a live setting. Leave value blank to just see the current one.")
+@app_commands.describe(setting="Which setting.", value="New value. Blank = show the current value and default without changing anything.")
+@app_commands.choices(setting=_SETTING_CHOICES)
+@app_commands.default_permissions(manage_channels=True)
+async def settings_cmd(interaction: discord.Interaction, setting: str, value: Optional[str] = None):
+    if not await _has_rank(interaction, "senior"):
+        return
+    gid = interaction.guild.id
+    if setting in CONFIGURABLE_SETTINGS:
+        if value is None:
+            await configure_setting(interaction, setting, None)
+            return
+        current = await get_config_value(gid, setting)
+        await _confirm(interaction, f"⚙️ Change **{CONFIGURABLE_SETTINGS[setting]['label']}** from `{current}` to `{value}`? (Takes effect immediately.)",
+                       lambda i: configure_setting(i, setting, value), yes_label="Change it")
+    elif setting == "managed_servers":
+        current = ",".join(await get_managed_servers(gid))
+        if value is None:
+            await _reply(interaction, f"🗺️ **Supported game servers:** `{current}`\nTo change: run again with `value` like `21,121` or `10-15`.")
+            return
+        await _confirm(interaction, f"🗺️ Change the supported game servers from `{current}` to `{value}`? New server roles/channels get created as needed; nothing is deleted.",
+                       lambda i: configure_servers(i, value), yes_label="Change it")
+    elif setting in ("innovator_program", "rogue_bot_program"):
+        key = "innovator_program_active" if setting == "innovator_program" else "rogue_bot_program_active"
+        fn = toggle_innovator_program if setting == "innovator_program" else toggle_rogue_bot_program
+        current = await get_guild_setting(gid, key) != "0"
+        if value is None:
+            await _reply(interaction, f"🔘 **{_EXTRA_SETTINGS[setting]}** is currently **{'ON' if current else 'OFF'}**. To change: run again with `value` = `on` or `off`.")
+            return
+        wanted = _parse_on_off(value)
+        if wanted is None:
+            await _reply(interaction, "❓ For this one, `value` is just `on` or `off`.")
+            return
+        if wanted == current:
+            await _reply(interaction, f"ℹ️ It's already **{'ON' if current else 'OFF'}** — nothing to do.")
+            return
+        await _confirm(interaction, f"🔘 Turn **{_EXTRA_SETTINGS[setting]}** **{'ON' if wanted else 'OFF'}**?", lambda i: fn(i, wanted), yes_label="Yes")
+    else:  # monthly_prize
+        current = await get_guild_setting(gid, "monthly_prize") or DEFAULT_MONTHLY_PRIZE
+        if value is None:
+            await _reply(interaction, f"🏆 **Monthly prize:** {current}\nTo change: run again with `value` = the prize text (or `reset` for the default).")
+            return
+        new = "" if value.strip().lower() in ("reset", "default", "none") else value
+        await _confirm(interaction, f"🏆 Set the Monthly Champion prize to **{new or DEFAULT_MONTHLY_PRIZE}**?", lambda i: set_monthly_prize(i, new), yes_label="Set it")
+
+
+# ---------------------------------------------------------------- /innovators
+@bot.tree.command(name="innovators", description="Dictator: bulk-grant the Innovator badge to everyone here, or re-grant it to everyone on record.")
+@app_commands.describe(action="grant-everyone ignores the caps (one-time, for adopting a server). restore fixes wiped badges.")
+@app_commands.choices(action=[
+    app_commands.Choice(name="grant-everyone — badge for every current member, bypassing caps", value="all"),
+    app_commands.Choice(name="restore — re-grant the badge to everyone recorded in the database", value="restore"),
+])
+@app_commands.default_permissions(administrator=True)
+async def innovators_cmd(interaction: discord.Interaction, action: str):
+    if not await _has_rank(interaction, "dictator"):
+        return
+    if action == "all":
+        await _confirm(interaction, "🌟 Give the **Innovator** badge to **every** non-bot member currently in the server, ignoring the usual caps? This can't be undone in bulk.",
+                       grant_innovator_to_current_members, yes_label="Grant to everyone", danger=True)
+    else:
+        await _confirm(interaction, "🌟 Re-grant the Innovator badge to everyone recorded in the database who doesn't currently hold it?",
+                       restore_innovators, yes_label="Restore")
+
+
+# ---------------------------------------------------------------- /admin-tools
+@bot.tree.command(name="admin-tools", description="The rare, big levers: server adoption, migrations, nickname audit, DB panel, update announcement.")
+@app_commands.describe(
+    tool="Which tool. Each one says what it needs.",
+    tag="adopt-alliance / bulk-onboard: the alliance tag.",
+    servers="bulk-onboard: server number(s) for everyone, e.g. 21 or 21,121.",
+    member="enforce-registration: who must register now.",
+    role="add-request-role: the role name to add to the request menu.",
+    description="add-request-role: one line explaining that role.",
+)
+@app_commands.choices(tool=[
+    app_commands.Choice(name="re-check-nicknames — audit every nickname vs roles, with fix buttons (Judge+)", value="nicks"),
+    app_commands.Choice(name="enforce-registration — make one member register now (Judge+; needs member)", value="enforce"),
+    app_commands.Choice(name="add-request-role — add a role to the /request menu (Senator+; needs role + description)", value="addrole"),
+    app_commands.Choice(name="announce-update — fire the 'new version' announcement + 60s chat pause (Dictator)", value="announce"),
+    app_commands.Choice(name="database-panel — post the release-prisoners / reset-database panel to #logs (Dictator)", value="db"),
+    app_commands.Choice(name="adopt-alliance — fold an existing alliance's channels into our structure (Dictator; needs tag)", value="adopt"),
+    app_commands.Choice(name="migrate-legacy-roles — map old rank/admin roles into the new system (Dictator)", value="migrate"),
+    app_commands.Choice(name="bulk-onboard — register everyone here as one alliance (Dictator; needs tag + servers)", value="bulk"),
+])
+@app_commands.default_permissions(kick_members=True)
+async def admin_tools_cmd(interaction: discord.Interaction, tool: str, tag: Optional[str] = None, servers: Optional[str] = None,
+                          member: Optional[discord.Member] = None, role: Optional[str] = None, description: Optional[str] = None):
+    if tool == "nicks":
+        if await _has_rank(interaction, "staff"):
+            await re_check_nicknames(interaction)
+    elif tool == "enforce":
+        if not await _has_rank(interaction, "staff"):
+            return
+        if member is None:
+            await _reply(interaction, "🙋 Who? Run it again with the `member` option.")
+            return
+        await _confirm(interaction, f"📝 Flag {member.mention} for mandatory registration right now? They'll be pulled into #gateway.",
+                       lambda i: enforce_registration(i, member), yes_label="Flag them")
+    elif tool == "addrole":
+        if not await _has_rank(interaction, "senior"):
+            return
+        if not role or not description:
+            await _reply(interaction, "🛠️ This one needs both `role` (the role's name) and `description` (one line about it).")
+            return
+        await add_request_role(interaction, role, description)
+    else:
+        if not await _has_rank(interaction, "dictator"):
+            return
+        if tool == "announce":
+            await _confirm(interaction, f"📢 Post the **precinct-wide upgrade** announcement to every community channel and pause chat for {VERSION_HANDOFF_LOCKDOWN_SECONDS} seconds? "
+                                        "(Also starts a Rogue RoboCop round if that program is on.)", announce_update, yes_label="Announce", danger=True)
+        elif tool == "db":
+            await database_tools(interaction)  # posts a panel; the panel's own buttons confirm
+        elif tool == "adopt":
+            if not tag:
+                await _reply(interaction, "🏷️ Which alliance? Run it again with the `tag` option.")
+                return
+            await adopt_alliance(interaction, tag)  # a step-by-step wizard with its own confirmations
+        elif tool == "migrate":
+            await _confirm(interaction, "🎖️ Scan for old rank/admin roles from before RoboCop and walk through mapping them, one at a time?",
+                           migrate_legacy_roles, yes_label="Start the scan")
+        elif tool == "bulk":
+            if not tag or not servers:
+                await _reply(interaction, "📋 Bulk onboarding needs both `tag` and `servers` (e.g. tag `PTD`, servers `21`).")
+                return
+            await _confirm(interaction, f"🚨 Register **everyone** currently in the server as **[{tag.upper()}]** on server(s) **{servers}** and rewrite their nicknames? "
+                                        "This is meant for adopting an existing single-alliance server. Go ahead?",
+                           lambda i: bulk_onboard_existing(i, tag, servers), yes_label="Register everyone", danger=True)
 
 
 # ============================================================

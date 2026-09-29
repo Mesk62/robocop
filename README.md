@@ -9,9 +9,14 @@ A Discord bot for a *Police Chief* mobile-game community. It welcomes newcomers,
 - **Onboarding** — new members answer a few questions in a private `#gateway` channel (language, in-game name, alliance tag, game server) and get the matching roles and nickname.
 - **Alliances and ranks** — alliance roles and channels, R4/R5 rank requests with staff approval.
 - **Translation** — react 🌐 to any message for a private translation.
-- **Games** — Rock-Paper-Scissors, Cops & Robbers, Rogue RoboCop, with leaderboards.
+- **Games** — Rock-Paper-Scissors, Cops & Robbers (opt-in: you're only drafted or messaged about it if you join the roster), Rogue RoboCop, with leaderboards.
+- **Quiet by design** — it only DMs you about things you asked for or that concern you (your registration, a rank request, a warning, a game you joined). No "welcome back" nudges, no daily digests when nothing happened.
 - **Moderation** — warnings, timeouts, a "prison" channel, bans and kicks, every one logged with an undo button.
 - **Self-checks** — on every startup it checks the server's roles and channels and reports problems to the staff-only `#logs` channel.
+
+## It will never ask you for
+
+Passwords, login codes, account emails, or payment — ever. If anything claiming to be RoboCop asks for those, it's a scam: report it to a moderator. Type `/safety` in the server to see this, and the list below, any time.
 
 ## What it stores about you — everything
 
@@ -28,6 +33,7 @@ A Discord bot for a *Police Chief* mobile-game community. It welcomes newcomers,
 ## What leaves the server
 
 - **Google Translate** — only when someone asks for a translation (🌐 or a non-English onboarding), the text being translated is sent to Google's official Cloud Translation API. Nothing is saved.
+- **Datamuse** (a free rhyming-dictionary service, api.datamuse.com) — once, when you finish registering, your in-game name is sent to it to find rhyming words for your welcome rhyme in the everyone-chat. Only the name goes out; nothing is saved. The rhymes are the bot's own lines, not song lyrics.
 - Posts in `#🐛-bugs` and `#💡-suggestions` are copied into the staff `#logs` channel so staff see them.
 - The bot notices when you come online so it can send the odd stats reminder, but it doesn't record it.
 
@@ -38,9 +44,10 @@ A Discord bot for a *Police Chief* mobile-game community. It welcomes newcomers,
 
 ## Discord access it needs, and why
 
-- **Server Members, Message Content and Presence intents** — to welcome new members, read answers typed in `#gateway`, and send online reminders.
+- **Server Members, Message Content and Presence intents** — to welcome new members, read answers typed in `#gateway`, and greet top-10 players / staff when they come online.
 - **Manage Roles, Nicknames and Channels** — to set up alliances, ranks and nicknames.
-- **Kick, Ban, Moderate Members, Manage Messages** — moderation tools, used by staff commands (and a few automatic safety rules, all logged).
+- **Create Private Threads, Send Messages in Threads, Manage Threads** — each Cops & Robbers round gets a private cops-only thread for the hourly clues (instead of a DM per cop per hour). Without these it falls back to DMs.
+- **Kick, Ban, Moderate Members, Manage Messages** — moderation tools, used by staff commands (and a few automatic safety rules, all logged). Manage Messages also lets staff pin the `/safety` notice.
 - **View Audit Log** — so the `#visitors` log can tell "left" apart from "kicked" or "banned".
 
 ## One file not published
