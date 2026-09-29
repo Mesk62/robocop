@@ -2011,12 +2011,6 @@ NAME_CHANGE_REMINDER = (
 )
 
 
-def abilities_mention(guild) -> str:
-    """Clickable #❓-abilities link when the channel exists, plain text otherwise."""
-    ch = discord.utils.get(guild.text_channels, name="❓-abilities") if guild else None
-    return ch.mention if ch else "#❓-abilities"
-
-
 def is_staff_member(member: discord.Member) -> bool:
     """JUDGE, SENATOR, DICTATOR, or a true Discord Administrator."""
     if member.guild_permissions.administrator:
@@ -2463,9 +2457,22 @@ async def leadership_watchdog():
     actually lives. A new instance pointed at a different/empty database
     won't be able to take over."""
     global _is_leader
+    misses = 0
     while True:
         await asyncio.sleep(LEADERSHIP_CHECK_INTERVAL_SECONDS)
-        current_leader = await get_setting("active_instance_id")
+        try:
+            current_leader = await get_setting("active_instance_id")
+        except Exception as e:
+            # (10.1) A hiccup reading the database must not kill the watchdog —
+            # that would leave two instances running with nobody checking.
+            misses += 1
+            if misses in (1, 12, 120):
+                print(f"[LEADERSHIP] couldn't read the database ({type(e).__name__}: {e}) — retrying every {LEADERSHIP_CHECK_INTERVAL_SECONDS}s.")
+            continue
+        misses = 0
+        if current_leader is None:
+            await claim_leadership()  # wiped database: nobody owns the seat — take it, quietly
+            continue
         if current_leader != INSTANCE_ID:
             _is_leader = False
             print(f"[SYSTEM] 🔄 Instance {current_leader} has taken over. Instance {INSTANCE_ID} shutting down gracefully...")
@@ -2478,7 +2485,10 @@ async def leadership_watchdog():
             await bot.close()
             return
         else:
-            await set_setting("active_instance_heartbeat", datetime.now().isoformat())
+            try:
+                await set_setting("active_instance_heartbeat", datetime.now().isoformat())
+            except Exception as e:
+                print(f"[LEADERSHIP] heartbeat write failed ({type(e).__name__}: {e}) — will retry.")
 
 
 def clean_display_name(display_name: str) -> str:
@@ -2776,13 +2786,6 @@ def get_rank_shade(base_color: discord.Color, factor: float, floor: float) -> di
     return discord.Color.from_rgb(int(r2 * 255), int(g2 * 255), int(b2 * 255))
 
 
-def get_darkened_color(base_color: discord.Color):
-    r = max(0, ((base_color.value >> 16) & 0xFF) - 70)
-    g = max(0, ((base_color.value >> 8) & 0xFF) - 70)
-    b = max(0, (base_color.value & 0xFF) - 70)
-    return discord.Color((r << 16) + (g << 8) + b)
-
-
 async def compute_expected_role_order(guild) -> list:
     """The single source of truth for 'correct' sidebar/hierarchy order, top
     to bottom, skipping any role that doesn't currently exist. Shared by
@@ -2908,6 +2911,31 @@ async def execute_release(member: discord.Member, role: discord.Role):
         print(f"[ERROR] Failed to release prisoner {member.display_name}: {e}")
 
 
+def guarded_task(label: str):
+    """(10.1) Decorator for fire-and-forget background coroutines. Before, an
+    exception in one just printed a traceback nobody saw and the job silently
+    never happened (a prisoner never released, a lockdown never lifted). Now
+    it's reported like any other error: console, #logs, owner DM."""
+    def wrap(fn):
+        async def runner(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[BACKGROUND TASK FAILED] {label}: {type(e).__name__}: {e}")
+                guild = next((getattr(a, "guild", None) or (a if isinstance(a, discord.Guild) else None) for a in args if getattr(a, "guild", None) or isinstance(a, discord.Guild)), None)
+                for g in ([guild] if guild else list(bot.guilds)):
+                    try:
+                        await report_error(g, f"background task '{label}'", None, e)
+                    except Exception:
+                        pass
+        runner.__name__ = fn.__name__
+        return runner
+    return wrap
+
+
+@guarded_task("prison release timer")
 async def schedule_release(member: discord.Member, role: discord.Role, delay_seconds: float):
     print(f"[TIMER STARTED] {member.display_name} will be released from prison in {int(delay_seconds)} seconds.")
     await asyncio.sleep(max(0, delay_seconds))
@@ -2984,6 +3012,7 @@ async def engage_lockdown(guild, seconds: float):
     bot.loop.create_task(auto_lift_lockdown(guild, seconds))
 
 
+@guarded_task("lockdown auto-lift")
 async def auto_lift_lockdown(guild, delay_seconds):
     await asyncio.sleep(max(0, delay_seconds))
     await lift_lockdown(guild)
@@ -3039,10 +3068,11 @@ async def announce_version_handoff(guild):
             value=(
                 "Word from Internal Affairs: the retired instance is still out there, hiding among you under "
                 "a false identity, occasionally running its mouth right here in #🌍-everyone-chat. "
-                "`/catch <name>` the moment you think you've made them."
+                f"`/catch <name>` the moment you think you've made them — worth **{ACHIEVEMENT_WEIGHTS['rogue_catch']} points**."
             ),
             inline=False
         )
+    embed.add_field(name="🏆 What you're playing for", value=await prize_line(guild), inline=False)
     embed.add_field(
         name="🎮 STANDING ORDERS — OFF-DUTY ACTIVITIES",
         value="`/rps` for a quick duel against another Chief, or against this unit directly, if you're feeling brave.",
@@ -3372,8 +3402,15 @@ async def refresh_leadership_status(guild, tag: str):
     if row and row[0]:
         try:
             msg = await leadership_chat.fetch_message(row[0])
-        except (discord.NotFound, discord.Forbidden):
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             msg = None
+    if msg is None:  # wiped DB: adopt the pin that's already there
+        msg = await find_own_pinned(leadership_chat, f"🔒 **[{tag}] LEADERSHIP CHAT")
+        if msg:
+            async with db_connect() as conn:
+                cur = await conn.cursor()
+                await cur.execute("UPDATE alliances SET leadership_status_msg_id = ? WHERE tag = ?", (msg.id, tag))
+                await conn.commit()
 
     if msg:
         try:
@@ -3448,6 +3485,7 @@ async def approve_alliance(guild, tag: str, approver_label: str) -> bool:
     return True
 
 
+@guarded_task("alliance auto-approval timer")
 async def schedule_alliance_auto_approval(guild, tag: str, delay_seconds: float):
     print(f"[TIMER STARTED] [{tag}] will auto-approve in {int(delay_seconds)} seconds if untouched.")
     await asyncio.sleep(max(0, delay_seconds))
@@ -4655,15 +4693,6 @@ def compute_capabilities(member) -> list:
     return caps
 
 
-def build_abilities_text(capabilities) -> str:
-    blocks = []
-    for key in ORDERED_ABILITY_KEYS:
-        if key in capabilities:
-            block = ABILITY_BLOCKS[key]
-            blocks.append(block["header"] + "\n" + "\n".join(f"  {l}" for l in block["lines"]))
-    return "\n\n".join(blocks)
-
-
 async def mark_capabilities_notified(user_id: int, capabilities):
     if not capabilities:
         return
@@ -4830,18 +4859,6 @@ def build_public_command_reference(verbose: bool, for_member=None) -> list:
     return chunks
 
 
-async def send_command_reference_dm(member: discord.Member, header: str):
-    """DMs the verbose command list, filtered to what THIS member can run,
-    in their language. Used by the welcome DM and every clearance-upgrade
-    DM, so the list a person holds is always the one for their current rank."""
-    chunks = build_public_command_reference(verbose=True, for_member=member)
-    if not chunks:
-        return
-    chunks[0] = header + "\n" + chunks[0]
-    for chunk in chunks:
-        await send_long(member, await t(chunk, member.id))  # translations can run long
-
-
 async def sync_abilities_channel_reference(guild, abilities_ch):
     """Keeps a pinned, always-current SIMPLE command list at the top of
     #❓-abilities — this is deliberately what greets anyone opening the
@@ -4858,6 +4875,11 @@ async def sync_abilities_channel_reference(guild, abilities_ch):
 
     stored_raw = await get_setting(settings_key)
     stored_ids = json.loads(stored_raw) if stored_raw else []
+    if not stored_ids:  # wiped DB: adopt RoboCop's own pinned list in this channel, oldest first
+        try:
+            stored_ids = [m.id for m in sorted((m for m in await abilities_ch.pins() if m.author.id == guild.me.id and "COMMAND REFERENCE" in (m.content or "")), key=lambda m: m.created_at)]
+        except (discord.Forbidden, discord.HTTPException):
+            stored_ids = []
 
     old_messages = []
     for mid in stored_ids:
@@ -5455,6 +5477,7 @@ LANGUAGE_DEFAULT_SECONDS = 90  # no language picked by then -> English, instead 
 _resume_tasks = {}  # member_id -> pending auto-resume task
 
 
+@guarded_task("onboarding resume after cooldown")
 async def resume_onboarding_later(guild, member_id: int, delay_seconds: float, tag: str):
     await asyncio.sleep(max(0, delay_seconds) + 5)
     _resume_tasks.pop(member_id, None)
@@ -5531,6 +5554,7 @@ async def onboarding_beat(channel, seconds: float = 1.0):
         pass
 
 
+@guarded_task("gateway close-later")
 async def close_gateway_later(gateway_channel, member, delay: float):
     await asyncio.sleep(max(0, delay))
     try:
@@ -5818,9 +5842,24 @@ class SettingsPanelView(discord.ui.View):
             view=ChaseRosterView(), ephemeral=True)
 
 
+async def find_own_pinned(channel, marker: str):
+    """(10.1) The pinned message RoboCop itself posted that starts with `marker`,
+    or None. Lets a wiped database re-adopt what's already on the server
+    instead of pinning a duplicate."""
+    try:
+        for m in await channel.pins():
+            if m.author.id == channel.guild.me.id and (m.content or "").startswith(marker):
+                return m
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    return None
+
+
 async def ensure_pinned_notice(guild, channel, settings_key: str, content: str, view=None):
     """Keeps ONE pinned bot message at the top of a channel current: edits it
-    in place across restarts, reposts + re-pins only if it was deleted."""
+    in place across restarts, reposts + re-pins only if it was deleted.
+    If the database forgot the message id (wiped DB), the existing pin is
+    found by its first line and adopted."""
     key = f"{settings_key}_{guild.id}"
     stored = await get_setting(key)
     msg = None
@@ -5829,6 +5868,10 @@ async def ensure_pinned_notice(guild, channel, settings_key: str, content: str, 
             msg = await channel.fetch_message(int(stored))
         except (discord.NotFound, discord.HTTPException, ValueError):
             msg = None
+    if msg is None:
+        msg = await find_own_pinned(channel, content.split("\n", 1)[0][:60])
+        if msg:
+            await set_setting(key, str(msg.id))
     if msg:
         if msg.content != content or view is not None:
             try:
@@ -7447,6 +7490,22 @@ async def on_ready():
         else:
             for guild in bot.guilds:
                 await report_translation_failure(guild, translation_detail)
+        # (10.1) Same idea for the optional AI: one tiny call so a bad key
+        # shows up in the console and the owner's DMs, not in a member's face.
+        if AI_ENABLED:
+            model, base = ai_model_and_url()
+            probe = await ai_complete("Reply with exactly the word OK.", "ping", max_tokens=5)
+            if probe and "OK" in probe.upper():
+                print(f"[SYSTEM] 🤖 AI self-check passed ({AI_PROVIDER} · {model}).")
+            else:
+                print(f"[WARNING] 🤖 AI self-check FAILED ({AI_PROVIDER} · {model} · {base}) — see the [AI ...] line above for the reason. /help still works from the built-in guide.")
+                for guild in bot.guilds:
+                    await notify_owner(guild, "🤖 The AI helper isn't answering",
+                                       f"Provider **{AI_PROVIDER}**, model `{model}`. The test call failed — usually a wrong or missing `AI_API_KEY` in `.env`, "
+                                       f"or a model name that provider doesn't offer (`AI_MODEL=` overrides it). The console shows the exact error. "
+                                       f"`/help question:` keeps working from the built-in guide meanwhile.", color=discord.Color.orange())
+        else:
+            print("[SYSTEM] 🤖 No AI provider configured (AI_PROVIDER/AI_API_KEY) — /help answers from the built-in guide only.")
 
     if is_takeover:
         # (10.0) Announce (and lock chat for a minute, and start a Rogue round)
@@ -7488,6 +7547,7 @@ async def on_ready():
             bot.loop.create_task(daily_nickname_maintenance_scheduler(guild))
             bot.loop.create_task(weekly_precinct_report_scheduler(guild))
             await safe_step(guild, "seed monthly baseline", ensure_monthly_baseline_seeded(guild))
+            await safe_step(guild, "scoring version", ensure_scoring_version(guild))
             bot.loop.create_task(monthly_champion_scheduler(guild))
             await safe_step(guild, "resume Rogue RoboCop round", reschedule_active_rogue_round(guild))
         else:
@@ -7579,6 +7639,7 @@ async def on_guild_join(guild):
     bot.loop.create_task(daily_nickname_maintenance_scheduler(guild))
     bot.loop.create_task(weekly_precinct_report_scheduler(guild))
     await safe_step(guild, "seed monthly baseline", ensure_monthly_baseline_seeded(guild))
+    await safe_step(guild, "scoring version", ensure_scoring_version(guild))
     bot.loop.create_task(monthly_champion_scheduler(guild))
     await safe_step(guild, "resume Rogue RoboCop round", reschedule_active_rogue_round(guild))
 
@@ -7637,7 +7698,8 @@ async def on_raw_reaction_add(payload):
             await user.send("⚠️ Translation service is temporarily unavailable. Please try again in a moment.")
             return
 
-        await user.send(f"🌍 **Translated Message**: {translated_text}\n\n*(Original: {message.content})*")
+        # (10.1) A long message + its translation can pass Discord's 2000-char cap — split instead of failing silently.
+        await send_long(user, f"🌍 **Translated Message**: {translated_text}\n\n*(Original: {message.content})*")
 
         await increment_stat("translate_reactions_total")
         async with db_connect() as conn:
@@ -8078,8 +8140,10 @@ async def on_message(message):
     # guide (and AI, if configured), answered as a reply. Slash commands are
     # hard to find on a phone; an @mention isn't.
     if _is_leader and bot.user and bot.user in message.mentions and message.channel.name != "gateway":
-        question = re.sub(r"<@!?%d>" % bot.user.id, "", message.content).strip(" ,:?!") 
-        if len(question) >= 3:
+        question = re.sub(r"<@!?%d>" % bot.user.id, "", message.content).strip(" ,:!")
+        asks = ("?" in message.content or looks_on_topic(question)
+                or question.lower().split(" ")[0] in ("how", "what", "where", "why", "can", "help", "who", "when", "which", "is", "do", "does"))
+        if len(question.strip("?")) >= 3 and asks:  # "thanks @RoboCop" is not a question — stay quiet
             try:
                 await answer_mention_question(message, question)
             except Exception as e:
@@ -8336,7 +8400,7 @@ async def alliances_on_servers(guild, servers) -> list:
 
 async def _alliance_servers_text(guild, keys) -> str:
     """'on server 121' / 'on servers 21/121' / 'server unknown' for a set of same-tag keys."""
-    found = set()
+    found, raw_fields = set(), []
     async with db_connect() as conn:
         cur = await conn.cursor()
         for k in keys:
@@ -8344,8 +8408,9 @@ async def _alliance_servers_text(guild, keys) -> str:
                 found.add(tag_home_server(k))
                 continue
             await cur.execute("SELECT server_number FROM users WHERE alliance_tag = ? AND server_number IS NOT NULL", (k,))
-            for (srv,) in await cur.fetchall():
-                found.update(await parse_stored_server_field(srv, guild.id))
+            raw_fields.extend(r[0] for r in await cur.fetchall())
+    for srv in raw_fields:  # parse OUTSIDE the connection — parse_stored_server_field opens its own
+        found.update(await parse_stored_server_field(srv, guild.id))
     if not found:
         return "server unknown"
     nums = sorted(found, key=lambda x: int(x) if x.isdigit() else 0)
@@ -8356,10 +8421,11 @@ class AlliancePickView(discord.ui.View):
     """One button per alliance on their server (or a dropdown when there are
     too many for buttons), plus '➕ Mine isn't listed'. result = key | '__other__'."""
 
-    def __init__(self, member, offered):
+    def __init__(self, member, offered, on_pick=None):
         super().__init__(timeout=240.0)
         self.member = member
         self.result = None
+        self.on_pick = on_pick  # optional coroutine(interaction, key) — used by /fix-me; onboarding just reads .result
         if len(offered) <= ALLIANCE_PICK_MAX_BUTTONS:
             for i, (key, count, _srv) in enumerate(offered):
                 label = f"[{tag_display(key)}] · {count} member" + ("" if count == 1 else "s")
@@ -8373,8 +8439,11 @@ class AlliancePickView(discord.ui.View):
 
             async def on_select(interaction: discord.Interaction, sel=sel):
                 self.result = sel.values[0]
-                await interaction.response.edit_message(view=None)
                 self.stop()
+                if self.on_pick:
+                    await self.on_pick(interaction, self.result)
+                else:
+                    await interaction.response.edit_message(view=None)
             sel.callback = on_select
             self.add_item(sel)
             other_row = 1
@@ -8391,9 +8460,12 @@ class AlliancePickView(discord.ui.View):
     def _pick(self, key):
         async def callback(interaction: discord.Interaction):
             self.result = key
+            self.stop()
+            if self.on_pick:
+                await self.on_pick(interaction, key)
+                return
             text = "➕ Okay — type it." if key == "__other__" else f"✅ **[{tag_display(key)}]** it is!"
             await interaction.response.edit_message(content=text, view=None)
-            self.stop()
         return callback
 
 
@@ -8532,84 +8604,89 @@ async def handle_member_join(member):
         )
         reg_row = await cursor.fetchone()
 
-        if reg_row and reg_row[0] and reg_row[1] and reg_row[2] and reg_row[3]:
-            tag, rank, srv = reg_row[1], reg_row[2], reg_row[3]
-            roles_to_add = [
-                discord.utils.get(guild.roles, name=ROLE_MEMBER),
-                discord.utils.get(guild.roles, name=tag)
-            ]
-            if rank in ("R3", "R4", "R5"):
-                roles_to_add.append(discord.utils.get(guild.roles, name=f"{tag}-{rank}"))
-            for num in await parse_stored_server_field(srv, guild.id):
-                srv_role = discord.utils.get(guild.roles, name=role_name_for_server(num))
-                if srv_role:
-                    roles_to_add.append(srv_role)
+        row = None
+        returning = bool(reg_row and reg_row[0] and reg_row[1] and reg_row[2] and reg_row[3])
+        if not returning:
+            await cursor.execute("SELECT lifetime_invite_fails, timeout_until FROM users WHERE user_id = ?", (member.id,))
+            row = await cursor.fetchone()
+            if row is None:
+                await cursor.execute("INSERT INTO users (user_id, original_username, invite_strikes, lifetime_invite_fails) VALUES (?, ?, 0, 0)", (member.id, member.name))
+                await conn.commit()
+                onboard_console(member, f"🆕 FIRST VISIT — @{member.name}, account created {member.created_at:%Y-%m-%d}. Starting onboarding in #gateway")
 
-            for r in roles_to_add:
-                if r:
-                    try:
-                        await member.add_roles(r)
-                    except discord.HTTPException:
-                        pass
-
-            srv_display = format_server_display(await parse_stored_server_field(srv, guild.id))
-            new_nick = f"{reg_row[0]} [{tag_display(tag)}] {srv_display}"
+    # (10.1) Everything below runs OUTSIDE the connection: role edits, nickname
+    # edits and helpers that open their own connection used to sit inside it,
+    # which is a deadlock on SQLite and a wasted pooled connection on Postgres.
+    if returning:
+        tag, rank, srv = reg_row[1], reg_row[2], reg_row[3]
+        server_list = await parse_stored_server_field(srv, guild.id)
+        roles_to_add = [
+            discord.utils.get(guild.roles, name=ROLE_MEMBER),
+            discord.utils.get(guild.roles, name=tag)
+        ]
+        if rank in ("R3", "R4", "R5"):
+            roles_to_add.append(discord.utils.get(guild.roles, name=f"{tag}-{rank}"))
+        for num in server_list:
+            srv_role = discord.utils.get(guild.roles, name=role_name_for_server(num))
+            if srv_role:
+                roles_to_add.append(srv_role)
+        roles_to_add = [r for r in roles_to_add if r]
+        if roles_to_add:
             try:
-                await member.edit(nick=new_nick[:32])
+                await member.add_roles(*roles_to_add)  # one API call, not one per role
             except discord.HTTPException:
                 pass
 
-            await log_event(guild, f"🔄 **RETURNING CHIEF**\nUser {member.mention} rejoined. Restored roles and bypassed gateway.")
-            onboard_console(member, f"🔄 RETURNING registered Chief — roles restored as {new_nick[:32]}, skipped #gateway")
-            everyone_ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
-            if everyone_ch:
-                try:
-                    await everyone_ch.send(f"🚔 Look who's back — {member.mention}! Badge restored, desk exactly as you left it. ☕")
-                except discord.HTTPException:
-                    pass
+        new_nick = f"{reg_row[0]} [{tag_display(tag)}] {format_server_display(server_list)}"
+        try:
+            await member.edit(nick=new_nick[:32])
+        except discord.HTTPException:
+            pass
+
+        await log_event(guild, f"🔄 **RETURNING CHIEF**\nUser {member.mention} rejoined. Restored roles and bypassed gateway.")
+        onboard_console(member, f"🔄 RETURNING registered Chief — roles restored as {new_nick[:32]}, skipped #gateway")
+        everyone_ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
+        if everyone_ch:
+            try:
+                await everyone_ch.send(f"🚔 Look who's back — {member.mention}! Badge restored, desk exactly as you left it. ☕")
+            except discord.HTTPException:
+                pass
+        return
+
+    if row:
+        lifetime_fails = row[0]
+        timeout_until_str = row[1]
+        if lifetime_fails >= 6:
+            onboard_console(member, "🔨 banned on arrival — 6 lifetime invite-check failures")
+            try:
+                await member.ban(reason="Max lifetime invite failures (6).")
+                await log_mod_action(guild, "ban", member.id, member.display_name, "Robocop (Automated)", "Max lifetime invite failures (6).")
+            except discord.HTTPException:
+                pass
             return
+        if timeout_until_str and ASK_WHO_INVITED:  # this lockout only ever comes from failing the invite question
+            timeout_until = datetime.fromisoformat(timeout_until_str)
+            if now < timeout_until:
+                remaining_mins = max(1, int((timeout_until - now).total_seconds() / 60))
+                onboard_console(member, f"🛑 still locked out ({remaining_mins} min left) — removing them again")
 
-        await cursor.execute("SELECT lifetime_invite_fails, timeout_until FROM users WHERE user_id = ?", (member.id,))
-        row = await cursor.fetchone()
+                if gateway_channel:
+                    await gateway_channel.set_permissions(member, read_messages=True, send_messages=True)
+                    await gateway_channel.send(f"🛑 {member.mention}, you are currently locked out. You still have **{remaining_mins} minute(s)** left. See you then!")
 
-        if row:
-            lifetime_fails = row[0]
-            timeout_until_str = row[1]
-            if lifetime_fails >= 6:
-                onboard_console(member, "🔨 banned on arrival — 6 lifetime invite-check failures")
+                await asyncio.sleep(5)
                 try:
-                    await member.ban(reason="Max lifetime invite failures (6).")
-                    await log_mod_action(guild, "ban", member.id, member.display_name, "Robocop (Automated)", "Max lifetime invite failures (6).")
-                except discord.HTTPException:
-                    pass
+                    await member.kick(reason=f"Tried to bypass timeout ({remaining_mins}m left).")
+                    await log_mod_action(guild, "kick", member.id, member.display_name, "Robocop (Automated)", f"Tried to bypass an active timeout ({remaining_mins}m left).")
+                except discord.Forbidden:
+                    timeout_role = discord.utils.get(guild.roles, name=ROLE_TIMEOUT)
+                    member_role = discord.utils.get(guild.roles, name=ROLE_MEMBER)
+                    if timeout_role:
+                        await member.add_roles(timeout_role)
+                    if member_role and member_role in member.roles:
+                        await member.remove_roles(member_role)
+                    await clear_gateway_override(guild, member)
                 return
-            if timeout_until_str and ASK_WHO_INVITED:  # this lockout only ever comes from failing the invite question
-                timeout_until = datetime.fromisoformat(timeout_until_str)
-                if now < timeout_until:
-                    remaining_mins = max(1, int((timeout_until - now).total_seconds() / 60))
-                    onboard_console(member, f"🛑 still locked out ({remaining_mins} min left) — removing them again")
-
-                    if gateway_channel:
-                        await gateway_channel.set_permissions(member, read_messages=True, send_messages=True)
-                        await gateway_channel.send(f"🛑 {member.mention}, you are currently locked out. You still have **{remaining_mins} minute(s)** left. See you then!")
-
-                    await asyncio.sleep(5)
-                    try:
-                        await member.kick(reason=f"Tried to bypass timeout ({remaining_mins}m left).")
-                        await log_mod_action(guild, "kick", member.id, member.display_name, "Robocop (Automated)", f"Tried to bypass an active timeout ({remaining_mins}m left).")
-                    except discord.Forbidden:
-                        timeout_role = discord.utils.get(guild.roles, name=ROLE_TIMEOUT)
-                        member_role = discord.utils.get(guild.roles, name=ROLE_MEMBER)
-                        if timeout_role:
-                            await member.add_roles(timeout_role)
-                        if member_role and member_role in member.roles:
-                            await member.remove_roles(member_role)
-                        await clear_gateway_override(guild, member)
-                    return
-        else:
-            await cursor.execute("INSERT INTO users (user_id, original_username, invite_strikes, lifetime_invite_fails) VALUES (?, ?, 0, 0)", (member.id, member.name))
-            await conn.commit()
-            onboard_console(member, f"🆕 FIRST VISIT — @{member.name}, account created {member.created_at:%Y-%m-%d}. Starting onboarding in #gateway")
 
     if gateway_channel:
         await gateway_channel.set_permissions(member, read_messages=True, send_messages=True)
@@ -9145,39 +9222,39 @@ async def handle_member_join(member):
                 cursor = await conn.cursor()
                 await cursor.execute("SELECT value FROM settings WHERE key = 'alliance_lock'")
                 lock_status = await cursor.fetchone()
-                if lock_status and lock_status[0] == 'locked':
-                    onboard_console(member, f"🔒 new alliance [{tag_input}] refused — alliance creation is locked (parked in #gateway)")
-                    await gateway_channel.send(await tf(
-                        "🔒 {mention}, new alliances are paused by staff right now, so I can't create **[{tag}]** yet. "
-                        "I've let them know you're waiting — hang tight, you're not in trouble.",
-                        member.id, mention=member.mention, tag=tag_input))
-                    await notify_staff_dm(guild, "🔒 Someone's waiting to create an alliance", f"{member.mention} wants to create **[{tag_input}]** but alliance creation is locked (`/alliance unlock`). They're parked in #gateway.", color=discord.Color.orange())
-                    return
-
                 await cursor.execute("SELECT tag FROM alliances WHERE creator_id = ?", (member.id,))
-                if await cursor.fetchone():
-                    await log_event(guild, f"⏳ **ALLIANCE CREATION BLOCKED**\nUser: {member.mention} | Attempted Tag: [{tag_input}]\nReason: User lifetime limit reached.")
-                    onboard_console(member, f"🚫 new alliance [{tag_input}] refused — they already founded one (parked in #gateway)")
-                    await gateway_channel.send(await tf(
-                        "🚫 {mention}, each Chief can only found one alliance here, and you've already started one. "
-                        "Double-check your tag — or type anything here and a human will help you sort it out.",
-                        member.id, mention=member.mention))
-                    return
-
+                already_founded = await cursor.fetchone()
                 await cursor.execute("SELECT value FROM settings WHERE key = 'timekeeper_burst'")
                 burst = await cursor.fetchone()
-                cooldown_ends = None
-                now_c = datetime.now()  # fresh — `now` was captured when they joined, possibly many minutes ago
-                if not (burst and datetime.fromisoformat(burst[0]) > now_c):
-                    await cursor.execute("SELECT created_at FROM alliances")
-                    # Newest REAL creation time. Anything claiming to be in the future is a
-                    # bad timestamp, never a reason to make someone wait.
-                    times = [ct for ct in (parse_db_local_time(r[0]) for r in await cursor.fetchall()) if ct and ct <= now_c + timedelta(minutes=1)]
-                    if times and now_c < max(times) + timedelta(minutes=ALLIANCE_CREATION_COOLDOWN_MINUTES):
-                        cooldown_ends = max(times) + timedelta(minutes=ALLIANCE_CREATION_COOLDOWN_MINUTES)
-
+                await cursor.execute("SELECT created_at FROM alliances")
+                created_rows = await cursor.fetchall()
                 await cursor.execute("SELECT color_hex FROM alliances")
                 existing_colors = {int(r[0]) for r in await cursor.fetchall() if r[0]}
+
+            if lock_status and lock_status[0] == 'locked':
+                onboard_console(member, f"🔒 new alliance [{tag_input}] refused — alliance creation is locked (parked in #gateway)")
+                await gateway_channel.send(await tf(
+                    "🔒 {mention}, new alliances are paused by staff right now, so I can't create **[{tag}]** yet. "
+                    "I've let them know you're waiting — hang tight, you're not in trouble.",
+                    member.id, mention=member.mention, tag=tag_input))
+                await notify_staff_dm(guild, "🔒 Someone's waiting to create an alliance", f"{member.mention} wants to create **[{tag_input}]** but alliance creation is locked (`/alliance unlock`). They're parked in #gateway.", color=discord.Color.orange())
+                return
+            if already_founded:
+                await log_event(guild, f"⏳ **ALLIANCE CREATION BLOCKED**\nUser: {member.mention} | Attempted Tag: [{tag_input}]\nReason: User lifetime limit reached.")
+                onboard_console(member, f"🚫 new alliance [{tag_input}] refused — they already founded one (parked in #gateway)")
+                await gateway_channel.send(await tf(
+                    "🚫 {mention}, each Chief can only found one alliance here, and you've already started one. "
+                    "Double-check your tag — or type anything here and a human will help you sort it out.",
+                    member.id, mention=member.mention))
+                return
+            cooldown_ends = None
+            now_c = datetime.now()  # fresh — `now` was captured when they joined, possibly many minutes ago
+            if not (burst and datetime.fromisoformat(burst[0]) > now_c):
+                # Newest REAL creation time. Anything claiming to be in the future is a
+                # bad timestamp, never a reason to make someone wait.
+                times = [ct for ct in (parse_db_local_time(r[0]) for r in created_rows) if ct and ct <= now_c + timedelta(minutes=1)]
+                if times and now_c < max(times) + timedelta(minutes=ALLIANCE_CREATION_COOLDOWN_MINUTES):
+                    cooldown_ends = max(times) + timedelta(minutes=ALLIANCE_CREATION_COOLDOWN_MINUTES)
 
             if cooldown_ends:
                 await park_for_alliance_cooldown(guild, member, gateway_channel, tag_input, cooldown_ends)
@@ -9641,7 +9718,7 @@ async def start_chase_round(guild, started_by: str) -> tuple:
         except discord.Forbidden:
             pass
 
-    announcement_msg = await general_ch.send(embed=discord.Embed(
+    chase_embed = discord.Embed(
         title="🚨 THE CHASE IS ON 🚨",
         description=(
             f"Somewhere among you, {len(cops)} cop(s) and {len(robbers)} robber(s) walk unseen. Nobody "
@@ -9653,7 +9730,9 @@ async def start_chase_round(guild, started_by: str) -> tuple:
         ),
         color=discord.Color.red(),
         timestamp=datetime.now()
-    ), view=ChaseRosterView())
+    )
+    chase_embed.add_field(name="🏆 What you're playing for", value=await prize_line(guild), inline=False)
+    announcement_msg = await general_ch.send(embed=chase_embed, view=ChaseRosterView())
     # 🚔 A private thread for the cops: clues land there (one post, not one
     #    DM per cop per hour) and the cops can confer. Falls back to DMs if
     #    the server can't make private threads.
@@ -10332,6 +10411,7 @@ async def maybe_post_roster_call(guild):
         pass
 
 
+@guarded_task("chase recruit DM")
 async def schedule_chase_recruit_dm(member, delay_seconds: float):
     await asyncio.sleep(max(0, delay_seconds))
     guild = member.guild
@@ -10817,22 +10897,6 @@ async def warn(interaction: discord.Interaction, member: discord.Member, reason:
         pass
 
 
-async def warnings_cmd(interaction: discord.Interaction, member: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-    async with db_connect() as conn:
-        cur = await conn.cursor()
-        await cur.execute("SELECT reason, timestamp FROM warnings WHERE user_id = ? ORDER BY timestamp DESC", (member.id,))
-        rows = await cur.fetchall()
-
-    if not rows:
-        await interaction.followup.send(f"✅ {member.display_name} has no warnings on file.", ephemeral=True)
-        return
-
-    out = f"⚠️ **Warning History for {member.display_name}** ({len(rows)} total):\n"
-    out += "\n".join([f"• {r[1]} — {r[0]}" for r in rows])
-    await interaction.followup.send(out[:2000], ephemeral=True)
-
-
 async def server_stats(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     async with db_connect() as conn:
@@ -10843,9 +10907,6 @@ async def server_stats(interaction: discord.Interaction):
 
         await cur.execute("SELECT COUNT(*) FROM translated_messages")
         distinct_messages = (await cur.fetchone())[0]
-
-        await cur.execute("SELECT user_id, referrals FROM user_stats WHERE referrals > 0 ORDER BY referrals DESC LIMIT 5")
-        top_referrers = await cur.fetchall()
 
         await cur.execute(
             "SELECT user_id, rps_wins, rps_losses, rps_ties FROM user_stats "
@@ -10867,12 +10928,6 @@ async def server_stats(interaction: discord.Interaction):
         ),
         inline=False
     )
-
-    if top_referrers:
-        lines = [f"<@{uid}> — {count} referral(s)" for uid, count in top_referrers]
-        embed.add_field(name="🎫 Top Referrers", value="\n".join(lines), inline=False)
-    else:
-        embed.add_field(name="🎫 Top Referrers", value="No referrals tracked yet.", inline=False)
 
     if top_rps:
         lines = []
@@ -11093,277 +11148,6 @@ async def bulk_onboard_existing(interaction: discord.Interaction, tag: str, serv
 # ------------------------------------------------------------
 
 
-
-
-async def _execute_ptd_upgrade(interaction: discord.Interaction, guild, tag: str, servers: list, log_lines: list):
-    """The actual PTD one-shot upgrade work, split out so the command
-    wrapper above can guarantee error reporting around it without needing
-    to touch a single line of the logic itself."""
-    # --- Alliance role, bulk-granted to everyone immediately (the exact
-    # gap that caused real problems earlier tonight if skipped) ---
-    tag_role = discord.utils.get(guild.roles, name=tag)
-    if not tag_role:
-        async with db_connect() as conn:
-            cur = await conn.cursor()
-            await cur.execute("SELECT color_hex FROM alliances")
-            existing_colors = {int(r[0]) for r in await cur.fetchall() if r[0]}
-        tag_color = get_distinct_alliance_color(existing_colors)
-        tag_role = await ensure_role(guild, tag, color=tag_color, hoist=True)
-        log_lines.append(f"🏷️ Created the **{tag}** role.")
-
-    granted = 0
-    for member in guild.members:
-        if not member.bot and tag_role not in member.roles:
-            try:
-                await member.add_roles(tag_role, reason="PTD one-shot upgrade.")
-                granted += 1
-            except discord.HTTPException:
-                pass
-    if granted:
-        log_lines.append(f"🏷️ Granted **{tag}** to **{granted}** existing member(s).")
-
-    # --- Category and known channels, using this server's exact names ---
-    category = discord.utils.get(guild.categories, name="[PTD] CHATS") or discord.utils.get(guild.categories, name="PTD CHATS")
-    if category:
-        try:
-            await category.edit(name=f"{tag} CHATS")
-            log_lines.append(f"📁 Renamed category to **{tag} CHATS**.")
-        except discord.HTTPException as e:
-            log_lines.append(f"⚠️ Couldn't rename category: {e}")
-    else:
-        cat_overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            tag_role: discord.PermissionOverwrite(view_channel=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True)
-        }
-        category = await guild.create_category(f"{tag} CHATS", overwrites=cat_overwrites)
-        log_lines.append(f"📁 Created fresh category **{tag} CHATS**.")
-
-    for old_name, new_name in {"strategy": "♟️-strategy", "screenshots": "📸-screenshots", "currently-active-events": "🚨-currently-active-events"}.items():
-        ch = discord.utils.get(category.text_channels, name=old_name) or discord.utils.get(guild.channels, name=new_name)
-        if ch and ch.name != new_name:
-            try:
-                await ch.edit(name=new_name, category=category)
-                log_lines.append(f"✏️ Renamed **#{old_name}** → **{new_name}**.")
-            except discord.HTTPException as e:
-                log_lines.append(f"⚠️ Couldn't rename {old_name}: {e}")
-        elif not ch:
-            await guild.create_text_channel(new_name, category=category)
-            log_lines.append(f"➕ Created **{new_name}**.")
-
-    existing_general = discord.utils.get(guild.channels, name=CH_EVERYONE)
-    old_lobby = discord.utils.get(category.text_channels, name="lobby")
-    if not existing_general and old_lobby:
-        main_text_cat = discord.utils.get(guild.categories, name="🏢 MAIN PRECINCT")
-        try:
-            await old_lobby.edit(name=CH_EVERYONE, category=main_text_cat)
-            log_lines.append("💬 Moved **#lobby** to the shared community area as **#🌍-everyone-chat**.")
-        except discord.HTTPException as e:
-            log_lines.append(f"⚠️ Couldn't repurpose #lobby: {e}")
-        await guild.create_text_channel("💬-lobby", category=category)
-        log_lines.append("💬 Created a fresh **#💬-lobby** for PTD.")
-    elif existing_general and not discord.utils.get(category.text_channels, name="💬-lobby"):
-        await guild.create_text_channel("💬-lobby", category=category)
-        log_lines.append("💬 **#🌍-everyone-chat** already existed — created **#💬-lobby** for PTD alongside it.")
-
-    welcome_ch = discord.utils.get(category.text_channels, name="welcome")
-    if welcome_ch:
-        admin_cat = discord.utils.get(guild.categories, name="Admin-Only")
-        try:
-            await welcome_ch.edit(category=admin_cat, sync_permissions=False)
-            await welcome_ch.set_permissions(guild.default_role, view_channel=False)
-            log_lines.append("🗄️ Archived **#welcome** — moved to Admin-Only, hidden, history kept.")
-        except discord.HTTPException as e:
-            log_lines.append(f"⚠️ Couldn't archive #welcome: {e}")
-
-    if not discord.utils.get(category.text_channels, name="🎖️-leadership-chat"):
-        leader_overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True),
-            tag_role: discord.PermissionOverwrite(view_channel=True, send_messages=False),
-        }
-        await guild.create_text_channel("🎖️-leadership-chat", category=category, overwrites=leader_overwrites)
-        log_lines.append("🎖️ Created **#🎖️-leadership-chat**.")
-
-    voice_cat = discord.utils.get(guild.categories, name="[PTD] Voice Channels") or discord.utils.get(guild.categories, name="PTD Voice Channels")
-    if voice_cat:
-        try:
-            await voice_cat.edit(name=f"{tag} Voice Channels")
-            log_lines.append(f"📁 Renamed voice category to **{tag} Voice Channels**.")
-        except discord.HTTPException:
-            pass
-        for old_name, new_name in {"Lobby VC": "🔊-Lobby-VC", "Event VC": "🚨🎙️-Event-VC"}.items():
-            vc = discord.utils.get(voice_cat.voice_channels, name=old_name)
-            if vc:
-                try:
-                    await vc.edit(name=new_name)
-                    log_lines.append(f"✏️ Renamed voice **{old_name}** → **{new_name}**.")
-                except discord.HTTPException:
-                    pass
-
-    async with db_connect() as conn:
-        cur = await conn.cursor()
-        await cur.execute(
-            "INSERT INTO alliances (tag, creator_id, status, color_hex, created_at) VALUES (?, ?, 'approved', ?, ?) "
-            "ON CONFLICT(tag) DO UPDATE SET status='approved'",
-            (tag, interaction.user.id, str(tag_role.color.value), datetime.now().isoformat())
-        )
-        await conn.commit()
-    log_lines.append(f"✅ Registered **[{tag}]** as an approved alliance.")
-
-    await enforce_role_hierarchy(guild)
-    await refresh_leadership_status(guild, tag)
-
-    # --- Legacy role migration, using the exact defaults already agreed on ---
-    admin_candidates, rank_candidates = await scan_legacy_roles(guild)
-    dictator_role = discord.utils.get(guild.roles, name=ROLE_DICTATOR)
-    member_role = discord.utils.get(guild.roles, name=ROLE_MEMBER)
-
-    for role in admin_candidates:
-        count = 0
-        for m in [mm for mm in role.members if not mm.bot]:
-            if dictator_role:
-                try:
-                    await m.add_roles(dictator_role, reason="PTD one-shot: legacy Admin -> Dictator.")
-                    count += 1
-                except discord.HTTPException:
-                    pass
-        async with db_connect() as conn:
-            cur = await conn.cursor()
-            await cur.execute("INSERT OR IGNORE INTO legacy_roles_tracked (guild_id, role_name, mapped_to) VALUES (?, ?, ?)", (guild.id, role.name, "DICTATOR"))
-            await conn.commit()
-        log_lines.append(f"👑 Legacy **{role.name}** ({count} holder(s)) → DICTATOR.")
-
-    for role, tier in rank_candidates:
-        human_members = [m for m in role.members if not m.bot]
-        count = 0
-        if tier >= 4:
-            rank_name = f"R{tier}"
-            for m in human_members:
-                try:
-                    await grant_alliance_rank(guild, m, tag, rank_name)
-                    count += 1
-                except Exception:
-                    pass
-            mapped_to = f"{tag}-{rank_name}"
-        else:
-            for m in human_members:
-                roles_to_add = [r for r in (tag_role, member_role) if r and r not in m.roles]
-                if roles_to_add:
-                    try:
-                        await m.add_roles(*roles_to_add, reason="PTD one-shot: legacy rank migration.")
-                        count += 1
-                    except discord.HTTPException:
-                        pass
-                else:
-                    count += 1
-            mapped_to = f"{tag} (member)"
-        async with db_connect() as conn:
-            cur = await conn.cursor()
-            await cur.execute("INSERT OR IGNORE INTO legacy_roles_tracked (guild_id, role_name, mapped_to) VALUES (?, ?, ?)", (guild.id, role.name, mapped_to))
-            await conn.commit()
-        log_lines.append(f"🎖️ Legacy **{role.name}** ({count} holder(s)) → {mapped_to}.")
-
-    # --- Register and rename everyone ---
-    srv_display = format_server_display(servers)
-    server_field = ",".join(servers)
-    onboarded, skipped = 0, 0
-    nickname_failures = []
-    role_grant_failures = []
-    role_req_ch = discord.utils.get(guild.channels, name="⚙️-role-requests")
-    abilities_ch = discord.utils.get(guild.channels, name="❓-abilities")
-
-    for member in guild.members:
-        if member.bot:
-            continue
-        async with db_connect() as conn:
-            cur = await conn.cursor()
-            await cur.execute("SELECT in_game_name, alliance_tag, rank_designation, server_number FROM users WHERE user_id = ?", (member.id,))
-            row = await cur.fetchone()
-        if row and row[0] and row[1] and row[2] and row[3]:
-            skipped += 1
-            continue
-
-        rank = "Member"
-        for candidate_rank in ("R5", "R4"):
-            candidate_role = discord.utils.get(guild.roles, name=f"{tag}-{candidate_rank}")
-            if candidate_role and candidate_role in member.roles:
-                rank = candidate_rank
-                break
-
-        in_game_name = strip_nickname_decorations(member.display_name) or member.name
-
-        async with db_connect() as conn:
-            cur = await conn.cursor()
-            await cur.execute(
-                "INSERT INTO users (user_id, original_username, in_game_name, alliance_tag, rank_designation, server_number, "
-                "language_selected, invite_check_passed, test_disclaimer_ack) "
-                "VALUES (?, ?, ?, ?, ?, ?, 1, 1, 1) "
-                "ON CONFLICT(user_id) DO UPDATE SET in_game_name=excluded.in_game_name, alliance_tag=excluded.alliance_tag, "
-                "rank_designation=excluded.rank_designation, server_number=excluded.server_number",
-                (member.id, str(member), in_game_name, tag, rank, server_field)
-            )
-            await conn.commit()
-
-        roles_to_add = [r for r in (member_role, tag_role) if r]
-        for num in servers:
-            srv_role = discord.utils.get(guild.roles, name=role_name_for_server(num))
-            if srv_role:
-                roles_to_add.append(srv_role)
-        try:
-            await member.add_roles(*roles_to_add)
-        except discord.HTTPException as e:
-            role_grant_failures.append(f"{member.mention} ({e})")
-
-        name_budget = 32 - len(f" [{tag_display(tag)}] {srv_display}")
-        new_nick = f"{in_game_name[:max(1, name_budget)]} [{tag_display(tag)}] {srv_display}"
-        try:
-            await member.edit(nick=new_nick[:32])
-        except discord.Forbidden:
-            if member.id == guild.owner_id:
-                nickname_failures.append(f"{member.mention} (server owner — Discord never allows a bot to rename the owner, no matter its permissions; you'll need to set this one yourself)")
-            else:
-                nickname_failures.append(f"{member.mention} (likely holds a role positioned above mine)")
-        except discord.HTTPException as e:
-            nickname_failures.append(f"{member.mention} ({e})")
-
-        try:
-            await member.send(embed=discord.Embed(
-                title="🚔 You're officially registered",
-                description=(
-                    f"This server just got upgraded, and you've been carried over as **[{tag}]**, server "
-                    f"**{srv_display}** — no action needed on your part, that's already done.\n\n"
-                    f"Run `/help` any time (also works great in {abilities_ch.mention if abilities_ch else '#❓-abilities'}) "
-                    f"for a full rundown of what you can do. And if you actually play on more than just server "
-                    f"{srv_display}, head to {role_req_ch.mention if role_req_ch else '#⚙️-role-requests'} to add any "
-                    f"other servers you're on.\n\nIf your in-game name isn't quite right, `/fix-me nicknames` fixes that any time."
-                ),
-                color=discord.Color.blue()
-            ))
-        except discord.Forbidden:
-            pass
-
-        onboarded += 1
-
-    log_lines.append(f"👥 Registered **{onboarded}** member(s), skipped **{skipped}** already-registered.")
-    if role_grant_failures:
-        log_lines.append(f"⚠️ **{len(role_grant_failures)}** member(s) couldn't be granted their roles — this means they may still be missing general-chat access:")
-        for failure in role_grant_failures:
-            log_lines.append(f"   • {failure}")
-    if nickname_failures:
-        log_lines.append(f"⚠️ **{len(nickname_failures)}** nickname(s) couldn't be changed (registration itself still succeeded for these people):")
-        for failure in nickname_failures:
-            log_lines.append(f"   • {failure}")
-
-    summary = "\n".join(f"• {line}" for line in log_lines)
-    await send_long(interaction.followup, f"🎖️ **PRECINCT UPGRADE COMPLETE — PTD DIVISION FULLY OPERATIONAL.**\n\n{summary}\n\nAll units accounted for. Good work, Chief.", ephemeral=True)
-    await log_event(guild, f"📇 **PTD ONE-SHOT UPGRADE COMPLETE**\nBy: {interaction.user.mention}\n{summary}")
-
-    await interaction.followup.send(
-        "Anyone else need a rank? Pick them below and assign R4/R5 directly, or just ignore this if not.",
-        view=GrantRankPickerView(tag),
-        ephemeral=True
-    )
 
 
 async def adopt_alliance(interaction: discord.Interaction, tag: str):
@@ -12331,24 +12115,6 @@ async def show_role(interaction: discord.Interaction, role: discord.Role):
     await interaction.response.send_message(out[:2000], ephemeral=True)
 
 
-async def show_db_fields(interaction: discord.Interaction, member: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-    async with db_connect() as conn:
-        cur = await conn.cursor()
-        await cur.execute("SELECT user_id, original_username, in_game_name, alliance_tag, rank_designation, server_number, invite_strikes, lifetime_invite_fails, timeout_until, pref_lang, prison_until FROM users WHERE user_id = ?", (member.id,))
-        row = await cur.fetchone()
-
-    if not row:
-        await interaction.followup.send(f"❌ No database record found for {member.mention}.", ephemeral=True)
-        return
-
-    fields = ["User ID", "Original Username", "In-Game Name", "Alliance Tag", "Rank Designation", "Server Number", "Invite Strikes", "Lifetime Fails", "Timeout Until", "Pref Lang", "Prison Until"]
-    out = f"📂 **Database Fields for {member.display_name}:**\n"
-    for field, val in zip(fields, row):
-        out += f"• **{field}:** {val if val is not None else 'None'}\n"
-    await interaction.followup.send(out[:2000], ephemeral=True)
-
-
 async def show_field(interaction: discord.Interaction, field: str):
     allowed_fields = {"alliance_tag", "server_number", "rank_designation", "in_game_name"}
     if field not in allowed_fields:
@@ -12757,9 +12523,8 @@ async def stats_cmd(interaction: discord.Interaction):
         title=f"📊 {interaction.user.display_name}'s Stats",
         color=discord.Color.blurple()
     )
-    embed.add_field(name="🎮 Rock, Paper, Scissors", value=f"{rps_wins}W / {rps_losses}L / {rps_ties}T", inline=True)
+    embed.add_field(name="🎮 Rock, Paper, Scissors (for fun)", value=f"{rps_wins}W / {rps_losses}L / {rps_ties}T", inline=True)
     embed.add_field(name="🕵️ Rogue RoboCop Catches", value=str(rogue_catches), inline=True)
-    embed.add_field(name="🎯 Referrals", value=str(referrals), inline=True)
     embed.add_field(
         name="🚔 Cops & Robbers",
         value=(
@@ -12771,13 +12536,13 @@ async def stats_cmd(interaction: discord.Interaction):
         inline=False
     )
     if is_innovator:
-        embed.add_field(name="🌟 Innovator", value="Founding badge holder.", inline=True)
+        embed.add_field(name="🌟 Innovator", value="Founding badge holder (a badge, not points).", inline=True)
     embed.add_field(
         name="🏆 Overall",
         value=f"**{my_score}** points" + (f" — ranked **#{rank}**" if rank else " — not on the board yet, get out there!"),
         inline=False
     )
-    embed.set_footer(text="Points: referral=2, RPS win=1, rogue catch=5, chase round win=3, arrest/ambush=2, Innovator=+10")
+    embed.set_footer(text=SCORING_LINE + " · RPS and Innovator are for glory, not points")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -12817,7 +12582,9 @@ async def monthly_standings_cmd(interaction: discord.Interaction):
 
     standings = await compute_monthly_champion_standings(interaction.guild)
     if not standings:
-        await interaction.followup.send("📅 Nobody's scored anything yet this month — plenty of time left to change that.")
+        prize = await get_guild_setting(interaction.guild.id, "monthly_prize") or DEFAULT_MONTHLY_PRIZE
+        view = PrizeButtonView() if isinstance(interaction.user, discord.Member) and is_senior_staff_member(interaction.user) else None
+        await interaction.followup.send(f"📅 Nobody's scored anything yet this month — plenty of time left to change that.\n🏆 **Playing for:** {prize}\n{scoring_explainer()}", view=view)
         return
 
     lines = []
@@ -12827,13 +12594,39 @@ async def monthly_standings_cmd(interaction: discord.Interaction):
         prefix = MEDAL_LABEL[i] if i < 3 else f"**#{i + 1}**"
         lines.append(f"{prefix} — {label} ({month_score} points)")
 
+    prize = await get_guild_setting(interaction.guild.id, "monthly_prize") or DEFAULT_MONTHLY_PRIZE
     embed = discord.Embed(
         title="📅 MONTHLY STANDINGS (so far)",
-        description="\n".join(lines),
+        description=f"🏆 **Playing for:** {prize}\n\n" + "\n".join(lines),
         color=discord.Color.gold()
     )
+    embed.add_field(name="How points work", value=scoring_explainer(), inline=False)
     embed.set_footer(text="Live standings — resets automatically once the winners are announced next month.")
-    await interaction.followup.send(embed=embed)
+    view = PrizeButtonView() if isinstance(interaction.user, discord.Member) and is_senior_staff_member(interaction.user) else None
+    await interaction.followup.send(embed=embed, view=view)
+
+
+class PrizeModal(discord.ui.Modal, title="This month's prize"):
+    prize = discord.ui.TextInput(label="What does the Monthly Champion win?", placeholder="e.g. a $10 gift card", max_length=200, required=False)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await set_monthly_prize(interaction, self.prize.value)
+
+
+class PrizeButtonView(discord.ui.View):
+    """'✏️ Change the prize' — sits on /stats monthly (for Senator+) and on
+    the /settings monthly_prize reply, so setting a prize is a tap and a
+    text box, not a command with options."""
+
+    def __init__(self):
+        super().__init__(timeout=300.0)
+
+    @discord.ui.button(label="Change the prize", style=discord.ButtonStyle.primary, emoji="✏️")
+    async def change(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not is_senior_staff_member(interaction.user):
+            await interaction.response.send_message("🚫 Senator or higher sets the prize.", ephemeral=True)
+            return
+        await interaction.response.send_modal(PrizeModal())
 
 
 async def set_monthly_prize(interaction: discord.Interaction, prize: str = None):
@@ -13110,56 +12903,63 @@ class FixTagModal(discord.ui.Modal, title="Which alliance are you actually in?")
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        guild = interaction.guild
         new_tag = self.tag_input.value.strip().upper()
         if not (2 <= len(new_tag) <= 4 and new_tag.isalpha()):
             await interaction.followup.send("❌ A tag is 2–4 letters only (e.g. `PTD`). Run `/fix-me` again to retry.", ephemeral=True)
             return
+        await offer_tag_switch(interaction, self.member, new_tag)
 
-        async with db_connect() as conn:
-            cur = await conn.cursor()
-            await cur.execute("SELECT alliance_tag, rank_designation, server_number FROM users WHERE user_id = ?", (self.member.id,))
-            row = await cur.fetchone()
-            await cur.execute("SELECT tag FROM alliances")
-            known_keys = [r[0] for r in await cur.fetchall()]
-        my_servers = await parse_stored_server_field(row[2], guild.id) if row and row[2] else []
+
+async def offer_tag_switch(interaction: discord.Interaction, member, new_tag: str):
+    """Shared by the alliance buttons and the typed form in /fix-me: works out
+    which alliance they mean, warns an R5, then asks for a confirm.
+    `interaction` must already be acknowledged (deferred)."""
+    guild = interaction.guild
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        await cur.execute("SELECT alliance_tag, rank_designation, server_number FROM users WHERE user_id = ?", (member.id,))
+        row = await cur.fetchone()
+        await cur.execute("SELECT tag FROM alliances")
+        known_keys = [r[0] for r in await cur.fetchall()]
+    my_servers = await parse_stored_server_field(row[2], guild.id) if row and row[2] else []
+    if new_tag not in known_keys:
         new_tag = resolve_alliance_key(new_tag, my_servers, known_keys) or new_tag  # same tag on another server -> the right one
-        in_db = new_tag in known_keys
-        current_tag = row[0] if row else None
-        current_rank = row[1] if row else None
+    in_db = new_tag in known_keys
+    current_tag = row[0] if row else None
+    current_rank = row[1] if row else None
 
-        if new_tag == current_tag:
-            await interaction.followup.send(f"ℹ️ You're already in **[{new_tag}]** — nothing to change.", ephemeral=True)
-            return
+    if new_tag == current_tag:
+        await interaction.followup.send(f"ℹ️ You're already in **[{tag_display(new_tag)}]** — nothing to change.", ephemeral=True)
+        return
 
-        if not in_db and not tag_exists_live(guild, new_tag):
-            await interaction.followup.send(
-                f"🤔 There's no alliance **[{new_tag}]** on this server yet. If you're **founding** a new one, that needs a "
-                f"human — I've pinged staff. If you just mistyped it, run `/fix-me` again.",
-                ephemeral=True
-            )
-            await log_event(guild, f"🆘 **FIX-ME: UNKNOWN TAG**\n{self.member.mention} tried to switch to **[{new_tag}]**, which doesn't exist. They may be trying to found it — check in with them.")
-            await notify_staff_dm(guild, "🆘 /fix-me hit an unknown tag", f"{self.member.mention} wants to be in **[{new_tag}]**, which doesn't exist here. Might be a new alliance — worth a look.", color=discord.Color.orange(), urgent=True)
-            return
-
-        # R5s of the *current* tag get pointed at the right tool if it's the
-        # tag itself that's wrong, rather than quietly demoted to Member.
-        if current_tag and current_rank == "R5":
-            r5_role = discord.utils.get(guild.roles, name=f"{current_tag}-R5")
-            if r5_role and r5_role in self.member.roles:
-                await interaction.followup.send(
-                    f"👑 You're the **R5 of [{current_tag}]**. Two different things you might mean:\n"
-                    f"• The alliance's *tag itself* is wrong → use `/alliance rename tag:{current_tag} new_tag:{new_tag}` (keeps you R5, moves everyone).\n"
-                    f"• You personally are *moving* to [{new_tag}] → confirm below. **You'd become a regular Member there** and [{current_tag}] would lose its R5.",
-                    view=ConfirmTagSwitchView(self.member, current_tag, new_tag), ephemeral=True
-                )
-                return
-
+    if not in_db and not tag_exists_live(guild, new_tag):
         await interaction.followup.send(
-            f"🏷️ Move you from **[{current_tag or 'no alliance'}]** to **[{new_tag}]**?"
-            + (f" You'll lose your **{current_rank}** rank in [{current_tag}]." if current_rank in ("R4", "R5") else ""),
-            view=ConfirmTagSwitchView(self.member, current_tag, new_tag), ephemeral=True
+            f"🤔 There's no alliance **[{new_tag}]** on this server yet. If you're **founding** a new one, that needs a "
+            f"human — I've pinged staff. If you just mistyped it, run `/fix-me` again.",
+            ephemeral=True
         )
+        await log_member_trouble(guild, "🆘 FIX-ME: UNKNOWN TAG", f"{member.mention} tried to switch to **[{new_tag}]**, which doesn't exist. They may be trying to found it — check in with them. `/admin-tools set-member` can place them once it exists.", member, color=discord.Color.blurple())
+        await notify_staff_dm(guild, "🆘 /fix-me hit an unknown tag", f"{member.mention} wants to be in **[{new_tag}]**, which doesn't exist here. Might be a new alliance — worth a look.", color=discord.Color.orange(), urgent=True)
+        return
+
+    # R5s of the *current* tag get pointed at the right tool if it's the
+    # tag itself that's wrong, rather than quietly demoted to Member.
+    if current_tag and current_rank == "R5":
+        r5_role = discord.utils.get(guild.roles, name=f"{current_tag}-R5")
+        if r5_role and r5_role in member.roles:
+            await interaction.followup.send(
+                f"👑 You're the **R5 of [{tag_display(current_tag)}]**. Two different things you might mean:\n"
+                f"• The alliance's *tag itself* is wrong → use `/alliance action:rename tag:{current_tag} new_tag:{new_tag}` (keeps you R5, moves everyone).\n"
+                f"• You personally are *moving* to [{tag_display(new_tag)}] → confirm below. **You'd become a regular Member there** and [{tag_display(current_tag)}] would lose its R5.",
+                view=ConfirmTagSwitchView(member, current_tag, new_tag), ephemeral=True
+            )
+            return
+
+    await interaction.followup.send(
+        f"🏷️ Move you from **[{tag_display(current_tag) if current_tag else 'no alliance'}]** to **[{tag_display(new_tag)}]**?"
+        + (f" You'll lose your **{current_rank}** rank in [{tag_display(current_tag)}]." if current_rank in ("R4", "R5") else ""),
+        view=ConfirmTagSwitchView(member, current_tag, new_tag), ephemeral=True
+    )
 
 
 class ConfirmTagSwitchView(discord.ui.View):
@@ -13226,10 +13026,31 @@ class FixMeView(discord.ui.View):
         if await self._mine(interaction):
             await interaction.response.send_modal(ChangeNickModal(self.member, "via /fix-me"))
 
-    @discord.ui.button(label="My alliance tag is wrong", style=discord.ButtonStyle.primary, emoji="🏷️", row=0)
+    @discord.ui.button(label="My alliance is wrong", style=discord.ButtonStyle.primary, emoji="🏷️", row=0)
     async def fix_tag(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if await self._mine(interaction):
-            await interaction.response.send_modal(FixTagModal(self.member))
+        if not await self._mine(interaction):
+            return
+        # (10.1) Same buttons as onboarding: the alliances on their server, plus ➕ to type one.
+        member = self.member
+        async with db_connect() as conn:
+            cur = await conn.cursor()
+            await cur.execute("SELECT server_number FROM users WHERE user_id = ?", (member.id,))
+            row = await cur.fetchone()
+        servers = await parse_stored_server_field(row[0], interaction.guild.id) if row and row[0] else []
+        offered = await alliances_on_servers(interaction.guild, servers)
+        if not offered:
+            await interaction.response.send_modal(FixTagModal(member))
+            return
+
+        async def picked(i: discord.Interaction, key):
+            if key == "__other__":
+                await i.response.send_modal(FixTagModal(member))
+                return
+            await i.response.defer(ephemeral=True)
+            await offer_tag_switch(i, member, key)
+
+        await interaction.response.send_message("🏢 Which alliance are you in? Tap it — or ➕ to type a tag that isn't listed.",
+                                                view=AlliancePickView(member, offered, on_pick=picked), ephemeral=True)
 
     @discord.ui.button(label="My server is wrong", style=discord.ButtonStyle.primary, emoji="🗺️", row=1)
     async def fix_server(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -13292,7 +13113,7 @@ async def fix_me_cmd(interaction: discord.Interaction):
     servers = await parse_stored_server_field(row[2], interaction.guild.id)
     await interaction.response.send_message(
         f"🛠️ **Here's what I have on file for you:**\n"
-        f"• In-game name: **{row[0]}**\n• Alliance: **[{row[1]}]**\n• Server(s): **{'/'.join(servers) or '—'}**\n\n"
+        f"• In-game name: **{row[0]}**\n• Alliance: **[{tag_display(row[1])}]**\n• Server(s): **{'/'.join(servers) or '—'}**\n\n"
         f"What's wrong?",
         view=FixMeView(interaction.user), ephemeral=True
     )
@@ -13384,11 +13205,37 @@ async def register(interaction: discord.Interaction):
     await run_onboarding_safe(interaction.user)
 
 
+# (10.1) Points reward attention, not clicks. Only the two real games score:
+# Cops & Robbers (showing up, collars, surviving) and catching the Rogue.
+# RPS is for fun and stays in /stats; Innovator is a badge, not a head start;
+# referrals were retired with the invite check. SCORING_VERSION is stamped
+# per guild — when it changes, the monthly baseline is re-snapshotted so the
+# month restarts cleanly instead of mixing old and new points.
+SCORING_VERSION = "2"
 ACHIEVEMENT_WEIGHTS = {
-    "referral": 2, "rps_win": 1, "rogue_catch": 5,
-    "chase_cop_win": 3, "chase_robber_win": 3, "chase_arrest": 2, "chase_ambush": 2,
-    "innovator_bonus": 10,
+    "chase_move": 1,        # made a real move in a round (arrest/ambush attempt)
+    "chase_arrest": 3, "chase_ambush": 3,
+    "chase_cop_win": 5, "chase_robber_win": 5,
+    "rogue_catch": 15,
 }
+SCORING_LINE = "Points: chase move 1 · arrest/ambush 3 · round win 5 · Rogue catch 15"
+
+
+def scoring_explainer() -> str:
+    return (f"**How points work:** {SCORING_LINE}. Only the games score — RPS and the Innovator badge are for glory. "
+            f"Cops & Robbers is opt-in, so join the roster (#⚙️-settings or `/chase action:join`) to be in the running.")
+
+
+async def prize_line(guild) -> str:
+    """One line for game announcements: the prize, the scoring, who's leading."""
+    prize = await get_guild_setting(guild.id, "monthly_prize") or DEFAULT_MONTHLY_PRIZE
+    standings = await compute_monthly_champion_standings(guild)
+    lead = ""
+    if standings:
+        m = guild.get_member(standings[0][0])
+        if m:
+            lead = f" · Leading this month: **{m.display_name}** ({standings[0][1]} pts)"
+    return f"🏆 **This month's prize:** {prize}\n{SCORING_LINE}{lead} · `/stats view:monthly`"
 
 
 _leaderboard_cache = {}  # guild_id -> (monotonic_timestamp, results)
@@ -13398,7 +13245,7 @@ LEADERBOARD_CACHE_SECONDS = 300  # 5 minutes — plenty fresh for a fun leaderbo
 async def compute_leaderboard(guild, force_refresh: bool = False) -> list:
     """Returns [(user_id, score, breakdown_dict), ...] sorted descending —
     one combined ranking across every tracked achievement: RPS, Rogue
-    RoboCop catches, Cops & Robbers, referrals, and Innovator status.
+    RoboCop catches and Cops & Robbers (RPS/Innovator are shown, not scored).
     Only includes members still actually in the guild, and only those
     with a nonzero score. Cached briefly by default — this gets called
     on every single login for the top-10 celebration check, and that
@@ -13414,7 +13261,7 @@ async def compute_leaderboard(guild, force_refresh: bool = False) -> list:
         cur = await conn.cursor()
         await cur.execute("SELECT user_id, referrals, rps_wins, rogue_catches FROM user_stats")
         user_stat_rows = {r[0]: r for r in await cur.fetchall()}
-        await cur.execute("SELECT user_id, cop_wins, robber_wins, arrests_made, ambushes_made FROM chase_stats")
+        await cur.execute("SELECT user_id, cop_wins, robber_wins, arrests_made, ambushes_made, rounds_played, non_participation FROM chase_stats")
         chase_rows = {r[0]: r for r in await cur.fetchall()}
         await cur.execute("SELECT user_id FROM innovators")
         innovator_ids = {r[0] for r in await cur.fetchall()}
@@ -13425,23 +13272,22 @@ async def compute_leaderboard(guild, force_refresh: bool = False) -> list:
         if not guild.get_member(uid):
             continue
         us = user_stat_rows.get(uid, (uid, 0, 0, 0))
-        cs = chase_rows.get(uid, (uid, 0, 0, 0, 0))
+        cs = chase_rows.get(uid, (uid, 0, 0, 0, 0, 0, 0))
         is_innovator = uid in innovator_ids
+        moves = max(0, (cs[5] or 0) - (cs[6] or 0))  # rounds where they actually made a move
         breakdown = {
-            "referrals": us[1], "rps_wins": us[2], "rogue_catches": us[3],
-            "chase_cop_wins": cs[1], "chase_robber_wins": cs[2],
+            "rps_wins": us[2], "rogue_catches": us[3],
+            "chase_moves": moves, "chase_cop_wins": cs[1], "chase_robber_wins": cs[2],
             "chase_arrests": cs[3], "chase_ambushes": cs[4],
-            "innovator": is_innovator,
+            "innovator": is_innovator,  # shown as a badge, never scored
         }
         score = (
-            us[1] * ACHIEVEMENT_WEIGHTS["referral"] +
-            us[2] * ACHIEVEMENT_WEIGHTS["rps_win"] +
-            us[3] * ACHIEVEMENT_WEIGHTS["rogue_catch"] +
-            cs[1] * ACHIEVEMENT_WEIGHTS["chase_cop_win"] +
-            cs[2] * ACHIEVEMENT_WEIGHTS["chase_robber_win"] +
+            moves * ACHIEVEMENT_WEIGHTS["chase_move"] +
             cs[3] * ACHIEVEMENT_WEIGHTS["chase_arrest"] +
             cs[4] * ACHIEVEMENT_WEIGHTS["chase_ambush"] +
-            (ACHIEVEMENT_WEIGHTS["innovator_bonus"] if is_innovator else 0)
+            cs[1] * ACHIEVEMENT_WEIGHTS["chase_cop_win"] +
+            cs[2] * ACHIEVEMENT_WEIGHTS["chase_robber_win"] +
+            us[3] * ACHIEVEMENT_WEIGHTS["rogue_catch"]
         )
         if score > 0:
             results.append((uid, score, breakdown))
@@ -13499,6 +13345,23 @@ async def snapshot_monthly_baseline(guild):
             [(guild.id, uid, score) for uid, score, _ in leaderboard]
         )
         await conn.commit()
+
+
+async def ensure_scoring_version(guild):
+    """(10.1) When the point weights change, this month's race would be
+    nonsense (new-style totals minus old-style snapshots). So the baseline
+    is re-snapshotted once per scoring version, and everyone hears why."""
+    if await get_guild_setting(guild.id, "scoring_version") == SCORING_VERSION:
+        return
+    await snapshot_monthly_baseline(guild)
+    await set_guild_setting(guild.id, "scoring_version", SCORING_VERSION)
+    await log_event(guild, f"🏆 **SCORING CHANGED (v{SCORING_VERSION})** — monthly standings restarted from zero. {SCORING_LINE}.")
+    ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
+    if ch:
+        try:
+            await ch.send(f"🏆 **New scoring, fresh month.** {scoring_explainer()}\nThis month's standings start from zero right now — everyone's on equal footing.")
+        except discord.HTTPException:
+            pass
 
 
 async def ensure_monthly_baseline_seeded(guild):
@@ -13695,7 +13558,10 @@ async def abilities(interaction: discord.Interaction):
     )
     embed.add_field(name="🌐 Translation & Commands", value=await t(help_text, interaction.user.id), inline=False)
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="request-rank", description="Request a rank in your alliance. Both R4 and R5 need staff or your R5's approval.")
@@ -14696,7 +14562,13 @@ HOWDO_TASKS = [
     ("Play Rock-Paper-Scissors", "everyone", "rps rock paper scissors play game duel",
      "`/rps` (against RoboCop) or `/rps opponent:@someone`."),
     ("See scores and leaderboards", "everyone", "stats score leaderboard top 10 monthly standings rank me",
-     "`/stats` (yours), `/stats view:top10`, `view:monthly`, `view:games`, `view:alliances`."),
+     "`/stats` (yours), `/stats view:top10`, `view:monthly` (this month's race and the prize), `view:games`, `view:alliances`."),
+    ("How points and the prize work", "everyone", "points how do points work prize what is the prize win scoring score monthly champion gift card",
+     f"{SCORING_LINE}. Only Cops & Robbers and Rogue catches score — RPS and the Innovator badge are for glory. "
+     "Join the roster (#⚙️-settings) to be in the running. The prize and live standings: `/stats view:monthly`. Winners are announced on the 1st."),
+    ("Set the monthly prize", "senior", "set prize change prize monthly prize gift card reward announce prize",
+     "`/stats view:monthly` → tap **✏️ Change the prize** (Senator+), or `/settings setting:monthly_prize value:...`. "
+     "It's shown every time a game starts and in the monthly announcement."),
     ("Set my time zone or language", "everyone", "timezone time zone language set my language",
      "#⚙️-settings has a button for each, or `/timezone` and `/language`."),
     ("Is this bot safe? What does it store?", "everyone", "safe safety privacy scam what do you store data legit",
@@ -14734,8 +14606,42 @@ HOWDO_TASKS = [
     ("What can I do here?", "everyone", "what can i do commands list abilities help",
      "`/help` — your personal rundown. `/help everything:True` lists every command on the server, including staff ones."),
 ]
+# The AI only ever sees questions about THIS: RoboCop, this server, Discord,
+# and the games it runs. A question with none of these words in it never
+# leaves the building — no history lessons, no homework, no free chatbot.
+HOWDO_TOPIC_WORDS = {
+    # the bot & the server
+    "robocop", "bot", "command", "commands", "slash", "help", "server", "servers", "channel", "channels", "gateway", "settings", "logs",
+    "register", "registration", "onboarding", "nickname", "name", "tag", "alliance", "alliances", "rank", "ranks", "r4", "r5", "member", "members",
+    "role", "roles", "staff", "judge", "senator", "dictator", "admin", "mod", "moderator", "owner", "mesk",
+    # things RoboCop does
+    "translate", "translation", "language", "timezone", "time", "zone", "badge", "innovator", "lounge", "warn", "warning", "jail", "prison", "imprison",
+    "pardon", "ban", "banned", "unban", "kick", "kicked", "record", "lookup", "announce", "announcement", "lockdown", "killswitch", "safety", "scam",
+    "password", "stats", "leaderboard", "top", "monthly", "champion", "prize", "reset", "fresh", "start", "invite", "approve", "dissolve", "rename",
+    "merge", "lock", "unlock", "burst", "leadership", "request", "fix", "wrong", "change", "switch", "stuck", "join", "leave", "opt",
+    # games
+    "cops", "robbers", "chase", "arrest", "ambush", "robber", "cop", "clue", "clues", "rogue", "catch", "rps", "rock", "paper", "scissors", "game", "games", "round",
+    # discord basics
+    "discord", "phone", "mobile", "app", "desktop", "notification", "notifications", "mute", "dm", "dms", "message", "messages", "react", "reaction",
+    "emoji", "reply", "mention", "ping", "avatar", "profile", "thread", "pin", "pinned", "sidebar", "list", "button", "buttons", "menu", "type", "typing",
+    # game-side words that still concern the server
+    "police", "chief", "in-game", "ingame",
+}
+
+
+def looks_on_topic(question: str) -> bool:
+    words = set(re.findall(r"[a-z0-9\-]+", (question or "").lower()))
+    return bool(words & HOWDO_TOPIC_WORDS)
+
+
+OFF_TOPIC_REPLY = ("🚔 I only know about **this server and RoboCop** — commands, channels, ranks, the games, and basic Discord. "
+                   "Try `/help question:` with something like *\"change my server\"* or *\"how do I react to a message\"*.")
+
+
 HOWDO_TIER_LABEL = {"everyone": "", "r5": " *(R5 of that alliance, or staff)*", "staff": " *(Judge and up)*", "senior": " *(Senator and up)*", "dictator": " *(Dictator only)*"}
-HOWDO_MATCH_MIN = 0.28   # below this, the built-in list has no real answer
+HOWDO_MATCH_MIN = 0.28        # below this, the built-in list has no real answer
+HOWDO_MATCH_OFFTOPIC = 0.60   # a question with no RoboCop/Discord/game word in it must match MUCH better than that
+HOWDO_FUZZY_MIN = 0.80        # a fuzzy hit is a typo ("dissolvee"), not a vague resemblance ("happened"/"explained")
 # ---- AI backend (optional). Pick one in .env:
 #   AI_PROVIDER=gemini      free tier from aistudio.google.com (no card)      AI_API_KEY=...
 #   AI_PROVIDER=groq        free tier from console.groq.com (no card)          AI_API_KEY=...
@@ -14861,8 +14767,10 @@ def howdo_search(question: str, limit: int = 5, member=None) -> list:
         title, _tier, keywords, _answer = task
         bag = _howdo_tokens(keywords) | (_howdo_tokens(title) - _LIGHT_WORDS)  # "What do R4…" mustn't match every "how do I…"
         exact = sum(_w(t) for t in q & bag)
-        fuzzy = sum(_w(t) * max((SequenceMatcher(None, t, b).ratio() for b in bag if b not in _LIGHT_WORDS), default=0)
-                    for t in q if t not in bag and t not in _LIGHT_WORDS)
+        fuzzy = sum(_w(t) * r for t, r in
+                    ((t, max((SequenceMatcher(None, t, b).ratio() for b in bag if b not in _LIGHT_WORDS), default=0.0))
+                     for t in q if t not in bag and t not in _LIGHT_WORDS)
+                    if r >= HOWDO_FUZZY_MIN)
         score = (exact + 0.6 * fuzzy) / total
         if score > 0:
             if member is not None and howdo_can(member, _tier):
@@ -14889,38 +14797,6 @@ def format_howdo_answer(member, task) -> str:
     note = HOWDO_TIER_LABEL.get(tier, "")
     cant = "" if howdo_can(member, tier) else "\n⚠️ *You don't currently have the rank to run this — ask a staff member of that rank.*"
     return f"**{title}**{note}\n{answer}{cant}"
-
-
-# The AI only ever sees questions about THIS: RoboCop, this server, Discord,
-# and the games it runs. A question with none of these words in it never
-# leaves the building — no history lessons, no homework, no free chatbot.
-HOWDO_TOPIC_WORDS = {
-    # the bot & the server
-    "robocop", "bot", "command", "commands", "slash", "help", "server", "servers", "channel", "channels", "gateway", "settings", "logs",
-    "register", "registration", "onboarding", "nickname", "name", "tag", "alliance", "alliances", "rank", "ranks", "r4", "r5", "member", "members",
-    "role", "roles", "staff", "judge", "senator", "dictator", "admin", "mod", "moderator", "owner", "mesk",
-    # things RoboCop does
-    "translate", "translation", "language", "timezone", "time", "zone", "badge", "innovator", "lounge", "warn", "warning", "jail", "prison", "imprison",
-    "pardon", "ban", "banned", "unban", "kick", "kicked", "record", "lookup", "announce", "announcement", "lockdown", "killswitch", "safety", "scam",
-    "password", "stats", "leaderboard", "top", "monthly", "champion", "prize", "reset", "fresh", "start", "invite", "approve", "dissolve", "rename",
-    "merge", "lock", "unlock", "burst", "leadership", "request", "fix", "wrong", "change", "switch", "stuck", "join", "leave", "opt",
-    # games
-    "cops", "robbers", "chase", "arrest", "ambush", "robber", "cop", "clue", "clues", "rogue", "catch", "rps", "rock", "paper", "scissors", "game", "games", "round",
-    # discord basics
-    "discord", "phone", "mobile", "app", "desktop", "notification", "notifications", "mute", "dm", "dms", "message", "messages", "react", "reaction",
-    "emoji", "reply", "mention", "ping", "avatar", "profile", "thread", "pin", "pinned", "sidebar", "list", "button", "buttons", "menu", "type", "typing",
-    # game-side words that still concern the server
-    "police", "chief", "in-game", "ingame",
-}
-
-
-def looks_on_topic(question: str) -> bool:
-    words = set(re.findall(r"[a-z0-9\-]+", (question or "").lower()))
-    return bool(words & HOWDO_TOPIC_WORDS)
-
-
-OFF_TOPIC_REPLY = ("🚔 I only know about **this server and RoboCop** — commands, channels, ranks, the games, and basic Discord. "
-                   "Try `/help question:` with something like *\"change my server\"* or *\"how do I react to a message\"*.")
 
 
 async def howdo_ai_answer(question: str, member) -> Optional[str]:
@@ -14968,10 +14844,16 @@ async def howdo_ai_answer(question: str, member) -> Optional[str]:
 
 async def howdo_answer(interaction: discord.Interaction, question: str):
     """The /help question:… path. Ephemeral, always."""
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
     member = interaction.user
     hits = howdo_search(question, member=member)
     await increment_stat("howdo_questions")
-    if hits and hits[0][0] >= HOWDO_MATCH_MIN:
+    # (10.1) A question with no RoboCop/Discord/game word in it ("what happened
+    # in 1945") must match a guide entry *convincingly* — otherwise a stray
+    # word overlap makes RoboCop confidently answer the wrong question.
+    need = HOWDO_MATCH_MIN if looks_on_topic(question) else HOWDO_MATCH_OFFTOPIC
+    if hits and hits[0][0] >= need:
         best = hits[0][1]
         text = f"❓ *{question[:150]}*\n\n" + format_howdo_answer(member, best)
         others = [t for sc, t in hits[1:3] if sc >= HOWDO_MATCH_MIN * 0.6 and t is not best]
@@ -14993,6 +14875,9 @@ async def howdo_answer(interaction: discord.Interaction, question: str):
             await increment_stat("howdo_ai_answers")
             await _reply(interaction, f"❓ *{question[:150]}*\n\n🤖 {ai[:1700]}\n\n*(AI-written — if it looks off, ask {OWNER_HELPER_NAME}.)*")
             return
+    if not looks_on_topic(question):
+        await _reply(interaction, OFF_TOPIC_REPLY)
+        return
     closest = " · ".join(f"**{t[0]}**" for _sc, t in hits[:3]) if hits else ""
     await _reply(interaction, f"🤔 I don't have that one in my guide yet — I've noted it for {OWNER_HELPER_NAME}. "
                               + (f"Closest topics: {closest} — ask again with those words, or " if closest else "")
@@ -15010,7 +14895,7 @@ async def answer_mention_question(message, question: str):
     _mention_last[member.id] = now
     await increment_stat("howdo_questions")
     hits = howdo_search(question, member=member)
-    if hits and hits[0][0] >= HOWDO_MATCH_MIN:
+    if hits and hits[0][0] >= (HOWDO_MATCH_MIN if looks_on_topic(question) else HOWDO_MATCH_OFFTOPIC):
         text = format_howdo_answer(member, hits[0][1])
     else:
         await log_event(message.guild, f"❓ **HOW-DO QUESTION WITHOUT A GOOD ANSWER** — {member.mention} asked (by @mention): `{question[:200]}`" + (" (sent to AI)" if AI_ENABLED else ""))
@@ -15051,10 +14936,13 @@ async def help_cmd(interaction: discord.Interaction, question: Optional[str] = N
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
         return
+    # (10.1 hotfix) Acknowledge within Discord's 3-second window BEFORE any
+    # translation, database or AI work — otherwise "application did not respond".
+    await interaction.response.defer(ephemeral=True)
     if question and question.strip():
         await howdo_answer(interaction, question.strip())
         return
-    await abilities(interaction)  # the personnel-file embed (responds itself)
+    await abilities(interaction)  # the personnel-file embed
     chunks = build_public_command_reference(verbose=False, for_member=None if everything else interaction.user)
     for chunk in chunks:
         try:
@@ -15411,7 +15299,7 @@ async def settings_cmd(interaction: discord.Interaction, setting: str, value: Op
     else:  # monthly_prize
         current = await get_guild_setting(gid, "monthly_prize") or DEFAULT_MONTHLY_PRIZE
         if value is None:
-            await _reply(interaction, f"🏆 **Monthly prize:** {current}\nTo change: run again with `value` = the prize text (or `reset` for the default).")
+            await _reply(interaction, f"🏆 **Monthly prize:** {current}\nTap the button to change it (or run again with `value` = the prize text; `reset` = the default).", view=PrizeButtonView())
             return
         new = "" if value.strip().lower() in ("reset", "default", "none") else value
         await _confirm(interaction, f"🏆 Set the Monthly Champion prize to **{new or DEFAULT_MONTHLY_PRIZE}**?", lambda i: set_monthly_prize(i, new), yes_label="Set it")
@@ -15628,7 +15516,7 @@ async def fresh_start(interaction: discord.Interaction, user_id: int, invite_bac
                     lines.append(f"📨 Invite made, but **I can't DM them** (Discord only lets me message people who share a server with me). "
                                  f"Send them this yourself — one use, {INVITE_BACK_DAYS} days: {link}")
                 await log_event(guild, f"📨 **INVITE BACK** — {r['label']} by {interaction.user.mention}: " + ("DMed" if dm_ok else "link handed to staff") + f" · {link}")
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        await interaction.followup.send("\n".join(lines)[:1950], ephemeral=True)
     except Exception as e:
         ask = await report_error(guild, f"fresh start ({user_id})", interaction.user, e)
         await interaction.followup.send(f"{random.choice(CLIENT_ERROR_FLAVOR)}\n\n{ask}", ephemeral=True)
