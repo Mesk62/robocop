@@ -1,0 +1,5 @@
+discord.py>=2.3
+aiosqlite
+aiohttp
+python-dotenv
+tzdata  # timezone database for zoneinfo; Windows doesn't ship one

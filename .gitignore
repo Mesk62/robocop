@@ -1,0 +1,10 @@
+# Secrets — bot token and API keys. Never published.
+.env
+# The live database (members' data). Never published.
+*.db
+*.db-*
+# The owner's personal add-on. Never published.
+personal_extras.py
+# Rebuildable / junk
+.venv/
+__pycache__/
