@@ -196,6 +196,516 @@ class _DbConnectWrapper:
         return self._inner.__await__()
 
 
+# ============================================================
+#  POSTGRESQL BACKEND (9.0) — optional, switched on by DATABASE_URL.
+#
+#  Set DATABASE_URL=postgresql://user:password@host/dbname in .env and
+#  RoboCop stores everything in PostgreSQL instead of the local SQLite
+#  file. Leave it out and nothing changes: SQLite, exactly as before.
+#
+#  How it works: every query in this file was written for SQLite. Rather
+#  than rewrite 300+ of them (and risk a typo in any one), this layer
+#  hands the rest of the code the SAME connection/cursor interface
+#  aiosqlite does, and translates each statement on its way to Postgres:
+#    • ? placeholders            -> $1, $2, ...
+#    • INSERT OR IGNORE           -> INSERT ... ON CONFLICT DO NOTHING
+#    • INSERT OR REPLACE          -> INSERT ... ON CONFLICT (key) DO UPDATE
+#    • CURRENT_TIMESTAMP          -> the same UTC 'YYYY-MM-DD HH:MM:SS' text SQLite produces
+#    • cur.lastrowid              -> INSERT ... RETURNING <id>
+#    • INTEGER / TIMESTAMP types  -> BIGINT (Discord IDs are 64-bit) / TEXT
+#  Timestamps stay TEXT on purpose: the code stores and compares ISO
+#  strings everywhere, and parse_db_local_time() already reads both forms.
+#
+#  Values are converted to whatever type Postgres expects for each
+#  parameter (SQLite silently accepted '5' for 5 and vice versa; Postgres
+#  doesn't), and Postgres errors are re-raised as the sqlite3 error types
+#  the existing `except sqlite3.IntegrityError:` handlers already catch.
+#  Every statement runs inside its own savepoint, so one failed statement
+#  never poisons the rest of its connection's work — same as SQLite.
+#
+#  First start on an empty Postgres database with a SQLite file present:
+#  every table and row is copied across automatically, once. The SQLite
+#  file itself is never modified or deleted — it's your backup.
+# ============================================================
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+USE_POSTGRES = bool(DATABASE_URL)
+
+if USE_POSTGRES:
+    try:
+        import asyncpg
+    except ImportError:
+        raise SystemExit(
+            "[CRITICAL] DATABASE_URL is set, so RoboCop wants PostgreSQL — but the 'asyncpg' package isn't installed.\n"
+            "           Run:  pip install -r requirements.txt   (inside the venv), then start again.\n"
+            "           Or remove DATABASE_URL from .env to keep using SQLite."
+        )
+    from decimal import Decimal
+    from functools import lru_cache
+
+PG_UTC_NOW = "to_char(timezone('UTC', now()), 'YYYY-MM-DD HH24:MI:SS')"
+# Tables whose primary key is an auto-numbered id (SQLite AUTOINCREMENT).
+# Filled in from the schema at startup; INSERTs into them get RETURNING <id>.
+_PG_AUTO_ID = {}
+# Primary-key columns per table, for translating INSERT OR REPLACE.
+_PG_PRIMARY_KEYS = {}
+
+_SQL_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _pg_split_literals(sql: str):
+    """Yields (is_literal, text) chunks so rewrites only ever touch real SQL,
+    never the inside of a quoted string."""
+    out, buf, i, n = [], [], 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch in ("'", '"'):
+            if buf:
+                out.append((False, "".join(buf)))
+                buf = []
+            j = i + 1
+            while j < n:
+                if sql[j] == ch:
+                    if j + 1 < n and sql[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            out.append((True, sql[i:j + 1]))
+            i = j + 1
+        else:
+            buf.append(ch)
+            i += 1
+    if buf:
+        out.append((False, "".join(buf)))
+    return out
+
+
+def _pg_translate_ddl(sql: str) -> str:
+    s = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b", "BIGSERIAL PRIMARY KEY", sql, flags=re.I)
+    s = re.sub(r"\bAUTOINCREMENT\b", "", s, flags=re.I)
+    s = re.sub(r"DEFAULT\s+CURRENT_TIMESTAMP\b", f"DEFAULT ({PG_UTC_NOW})", s, flags=re.I)
+    # Type names only — case-sensitive on purpose, because there's a column
+    # literally called `timestamp` (lower case) that must stay a column name.
+    s = re.sub(r"\bINTEGER\b", "BIGINT", s)
+    s = re.sub(r"\b(TIMESTAMP|DATETIME)\b", "TEXT", s)
+    s = re.sub(r"\bREAL\b", "DOUBLE PRECISION", s)
+    s = re.sub(r"\bCREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS)", "CREATE TABLE IF NOT EXISTS ", s, flags=re.I)
+    s = re.sub(r"\bADD\s+COLUMN\s+(?!IF\s+NOT\s+EXISTS)", "ADD COLUMN IF NOT EXISTS ", s, flags=re.I)
+    return s
+
+
+def _pg_learn_schema(create_sql: str):
+    """Records a table's primary key (and whether it's an auto-numbered id)
+    from its CREATE TABLE statement."""
+    m = re.search(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"']?(\w+)[\"']?\s*\((.*)\)\s*;?\s*$", create_sql, flags=re.I | re.S)
+    if not m:
+        return
+    table, body = m.group(1), m.group(2)
+    tpk = re.search(r"PRIMARY\s+KEY\s*\(([^)]*)\)", body, flags=re.I)
+    if tpk:
+        _PG_PRIMARY_KEYS[table] = [c.strip().strip('"') for c in tpk.group(1).split(",") if c.strip()]
+    else:
+        for line in body.split(","):
+            cm = re.match(r"\s*[\"']?(\w+)[\"']?\s+\w+.*\bPRIMARY\s+KEY\b", line, flags=re.I | re.S)
+            if cm:
+                _PG_PRIMARY_KEYS[table] = [cm.group(1)]
+                if re.search(r"AUTOINCREMENT|BIGSERIAL", line, flags=re.I):
+                    _PG_AUTO_ID[table] = cm.group(1)
+                break
+
+
+def _pg_translate(sql: str):
+    """SQLite SQL -> (Postgres SQL, auto_id_column_or_None). Cached, since
+    the same few hundred statements repeat all day."""
+    return _pg_translate_cached(sql)
+
+
+def _pg_translate_uncached(sql: str):
+    stripped = sql.strip().rstrip(";").strip()
+    head = stripped[:20].upper()
+    if head.startswith("CREATE") or head.startswith("ALTER"):
+        ddl = _pg_translate_ddl(stripped)
+        if head.startswith("CREATE"):
+            _pg_learn_schema(ddl)
+        return ddl, None
+    if head.startswith("PRAGMA"):
+        return "SELECT 1 WHERE FALSE", None
+
+    parts, counter = [], 0
+    for is_lit, text in _pg_split_literals(stripped):
+        if is_lit:
+            parts.append(text)
+            continue
+        text = re.sub(r"\bCURRENT_TIMESTAMP\b", PG_UTC_NOW, text, flags=re.I)
+        rebuilt = []
+        for ch in text:
+            if ch == "?":
+                counter += 1
+                rebuilt.append(f"${counter}")
+            else:
+                rebuilt.append(ch)
+        parts.append("".join(rebuilt))
+    q = "".join(parts)
+
+    # Postgres needs `x = x + 1` inside ON CONFLICT ... DO UPDATE spelled
+    # `x = table.x + 1` (SQLite guessed which x you meant; Postgres won't).
+    um = re.match(r"\s*INSERT\s+INTO\s+(\w+)", q, flags=re.I)
+    dm = re.search(r"\bDO\s+UPDATE\s+SET\b", q, flags=re.I)
+    if um and dm:
+        table = um.group(1)
+        head_part, set_part = q[:dm.end()], q[dm.end():]
+        for col in set(re.findall(r"(?<![.\w])(\w+)\s*=(?!=)", set_part)):
+            set_part = re.sub(rf"(?<![.\w$]){col}\b(?!\s*=(?!=))", f"{table}.{col}", set_part)
+        q = head_part + set_part
+
+    auto_id = None
+    m = re.match(r"\s*INSERT\s+OR\s+(IGNORE|REPLACE)\s+INTO\s+(\w+)\s*(\(([^)]*)\))?", q, flags=re.I | re.S)
+    if m:
+        mode, table = m.group(1).upper(), m.group(2)
+        q = re.sub(r"^\s*INSERT\s+OR\s+(IGNORE|REPLACE)\s+INTO", "INSERT INTO", q, count=1, flags=re.I)
+        if mode == "IGNORE":
+            q += " ON CONFLICT DO NOTHING"
+        else:
+            pk = _PG_PRIMARY_KEYS.get(table)
+            cols = [c.strip() for c in (m.group(4) or "").split(",") if c.strip()]
+            if not pk:
+                raise sqlite3.OperationalError(f"Postgres layer: don't know the primary key of '{table}' for INSERT OR REPLACE")
+            others = [c for c in cols if c not in pk]
+            if others:
+                q += f" ON CONFLICT ({', '.join(pk)}) DO UPDATE SET " + ", ".join(f"{c} = EXCLUDED.{c}" for c in others)
+            else:
+                q += f" ON CONFLICT ({', '.join(pk)}) DO NOTHING"
+    im = re.match(r"\s*INSERT\s+INTO\s+(\w+)", q, flags=re.I)
+    if im and im.group(1) in _PG_AUTO_ID and not re.search(r"\bRETURNING\b", q, flags=re.I):
+        auto_id = _PG_AUTO_ID[im.group(1)]
+        q += f" RETURNING {auto_id}"
+    return q, auto_id
+
+
+if USE_POSTGRES:
+    _pg_translate_cached = lru_cache(maxsize=2048)(_pg_translate_uncached)
+else:
+    _pg_translate_cached = _pg_translate_uncached
+
+_PG_INT_TYPES = {"int2", "int4", "int8", "oid"}
+_PG_FLOAT_TYPES = {"float4", "float8"}
+_PG_TEXT_TYPES = {"text", "varchar", "bpchar", "name", "unknown", "char"}
+
+
+def _pg_coerce(param_types, params):
+    """SQLite let '123' and 123 mix freely; Postgres wants the exact type.
+    Convert each value to what this particular parameter expects."""
+    params = tuple(params or ())
+    out = []
+    for i, v in enumerate(params):
+        t = param_types[i].name if i < len(param_types) else "unknown"
+        if v is None:
+            out.append(None)
+            continue
+        if isinstance(v, bool):
+            v = int(v)
+        if t in _PG_INT_TYPES:
+            out.append(v if isinstance(v, int) else int(float(v)) if isinstance(v, (float, Decimal)) else int(str(v).strip()))
+        elif t in _PG_FLOAT_TYPES:
+            out.append(float(v))
+        elif t == "numeric":
+            out.append(Decimal(str(v)))
+        elif t in _PG_TEXT_TYPES:
+            out.append(str(v))  # str(datetime) == SQLite's own adapter format
+        else:
+            out.append(v)
+    return out
+
+
+def _pg_value(v):
+    if isinstance(v, Decimal):
+        return int(v) if v == v.to_integral_value() else float(v)
+    return v
+
+
+def _pg_to_sqlite_error(e: Exception) -> Exception:
+    """Re-raise Postgres errors as the sqlite3 types the code already catches."""
+    msg = f"{type(e).__name__}: {e}"
+    if isinstance(e, asyncpg.exceptions.IntegrityConstraintViolationError):
+        return sqlite3.IntegrityError(msg)
+    if isinstance(e, sqlite3.Error):
+        return e
+    return sqlite3.OperationalError(msg)
+
+
+_pg_pool = None
+
+
+async def _pg_get_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        _pg_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=20, command_timeout=30)
+    return _pg_pool
+
+
+class _PgCursor:
+    """Just enough of aiosqlite's cursor for this codebase."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._rows = []
+        self._pos = 0
+        self.rowcount = -1
+        self.lastrowid = None
+        self.description = None
+
+    async def execute(self, sql, params=()):
+        raw = await self._conn._begin()
+        q, auto_id = _pg_translate(sql)
+        await raw.execute("SAVEPOINT rc_stmt")
+        try:
+            if not params and not re.match(r"\s*(SELECT|INSERT|UPDATE|DELETE|WITH|VALUES)\b", q, flags=re.I):
+                status = await raw.execute(q)  # DDL etc. — simple protocol
+                rows = []
+            else:
+                stmt = await raw.prepare(q)
+                rows = await stmt.fetch(*_pg_coerce(stmt.get_parameters(), params))
+                status = stmt.get_statusmsg() or ""
+            await raw.execute("RELEASE SAVEPOINT rc_stmt")
+        except Exception as e:
+            try:
+                await raw.execute("ROLLBACK TO SAVEPOINT rc_stmt")
+                await raw.execute("RELEASE SAVEPOINT rc_stmt")
+            except Exception:
+                pass
+            raise _pg_to_sqlite_error(e) from e
+
+        tail = status.split()[-1] if status else ""
+        self.rowcount = int(tail) if tail.isdigit() else -1
+        if auto_id:
+            self.lastrowid = rows[0][0] if rows else None
+            self._rows = []
+        else:
+            self._rows = [tuple(_pg_value(v) for v in r) for r in rows]
+            self.description = tuple((k, None, None, None, None, None, None) for k in rows[0].keys()) if rows else None
+        self._pos = 0
+        return self
+
+    async def executemany(self, sql, seq_of_params):
+        total = 0
+        for params in seq_of_params:
+            await self.execute(sql, params)
+            total += max(self.rowcount, 0)
+        self.rowcount = total
+        return self
+
+    async def fetchone(self):
+        if self._pos < len(self._rows):
+            row = self._rows[self._pos]
+            self._pos += 1
+            return row
+        return None
+
+    async def fetchall(self):
+        rows = self._rows[self._pos:]
+        self._pos = len(self._rows)
+        return rows
+
+    async def fetchmany(self, size=1):
+        rows = self._rows[self._pos:self._pos + size]
+        self._pos += len(rows)
+        return rows
+
+    async def close(self):
+        pass
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        row = await self.fetchone()
+        if row is None:
+            raise StopAsyncIteration
+        return row
+
+
+class _PgConnection:
+    """Behaves like an aiosqlite connection: work happens in a transaction
+    that commit() saves and rollback() (or leaving without commit) discards."""
+
+    def __init__(self):
+        self._raw = None
+        self._tx = None
+
+    async def _open(self):
+        pool = await _pg_get_pool()
+        self._raw = await pool.acquire()
+        return self
+
+    async def _begin(self):
+        if self._tx is None:
+            self._tx = self._raw.transaction()
+            await self._tx.start()
+        return self._raw
+
+    async def cursor(self):
+        return _PgCursor(self)
+
+    async def execute(self, sql, params=()):
+        return await _PgCursor(self).execute(sql, params)
+
+    async def executemany(self, sql, seq_of_params):
+        return await _PgCursor(self).executemany(sql, seq_of_params)
+
+    async def commit(self):
+        if self._tx is not None:
+            tx, self._tx = self._tx, None
+            await tx.commit()
+
+    async def rollback(self):
+        if self._tx is not None:
+            tx, self._tx = self._tx, None
+            await tx.rollback()
+
+    async def close(self):
+        if self._raw is None:
+            return
+        try:
+            await self.rollback()
+        finally:
+            raw, self._raw = self._raw, None
+            await (await _pg_get_pool()).release(raw)
+
+    async def __aenter__(self):
+        return await self._open()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
+        return False
+
+    def __await__(self):
+        return self._open().__await__()
+
+
+class _SchemaRecorder:
+    """Stands in for a sqlite3 connection while init_db() runs in Postgres
+    mode: records every schema statement instead of executing it, so the
+    ONE schema definition in init_db() stays the single source of truth."""
+
+    def __init__(self):
+        self.statements = []
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, params=()):
+        self.statements.append(sql)
+        return self
+
+    def commit(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _schema_connection():
+    return _SchemaRecorder() if USE_POSTGRES else sqlite3.connect(DB_PATH)
+
+
+async def _pg_apply_schema(statements):
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        for sql in statements:
+            q, _ = _pg_translate_uncached(sql)
+            if q.startswith("SELECT 1 WHERE FALSE"):
+                continue
+            await conn.execute(q)
+    finally:
+        await conn.close()
+
+
+async def _pg_copy_from_sqlite():
+    """One-time move: an empty Postgres database + an existing SQLite file
+    -> copy every table and row across. Never touches the SQLite file."""
+    if not os.path.exists(DB_PATH):
+        print(f"[SYSTEM] 🐘 No SQLite file at {DB_PATH} — nothing to copy; starting Postgres fresh (the startup inventory rebuilds membership).")
+        return
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        if await conn.fetchval("SELECT value FROM settings WHERE key = 'pg_imported_from_sqlite'"):
+            return
+        if await conn.fetchval("SELECT COUNT(*) FROM users") or await conn.fetchval("SELECT COUNT(*) FROM settings"):
+            print("[SYSTEM] 🐘 Postgres already has data — skipping the SQLite import.")
+            return
+
+        print(f"[SYSTEM] 🐘 Copying the SQLite database into Postgres (one time only): {DB_PATH}")
+        src = sqlite3.connect(DB_PATH)
+        try:
+            tables = src.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").fetchall()
+            summary, problems = [], []
+            async with conn.transaction():
+                for name, create_sql in tables:
+                    if not create_sql:
+                        continue
+                    ddl, _ = _pg_translate_uncached(create_sql)
+                    await conn.execute(ddl)  # personal/extra tables that init_db doesn't know about
+                    cols = [r[1] for r in src.execute(f'PRAGMA table_info("{name}")').fetchall()]
+                    rows = src.execute(f'SELECT {", ".join(chr(34) + c + chr(34) for c in cols)} FROM "{name}"').fetchall()
+                    if not rows:
+                        continue
+                    placeholders = ", ".join(f"${i + 1}" for i in range(len(cols)))
+                    stmt = await conn.prepare(
+                        f'INSERT INTO "{name}" ({", ".join(chr(34) + c + chr(34) for c in cols)}) VALUES ({placeholders}) ON CONFLICT DO NOTHING'
+                    )
+                    types = stmt.get_parameters()
+                    copied = 0
+                    for row in rows:
+                        try:
+                            async with conn.transaction():  # savepoint: one odd row can't sink the rest
+                                await stmt.fetch(*_pg_coerce(types, row))
+                            copied += 1
+                        except Exception as e:
+                            if len(problems) < 20:
+                                problems.append(f"{name}: skipped a row ({type(e).__name__}: {str(e)[:80]})")
+                    summary.append(f"{name}: {copied}/{len(rows)}")
+                    auto = _PG_AUTO_ID.get(name)
+                    if auto:
+                        await conn.execute(
+                            f"SELECT setval(pg_get_serial_sequence('{name}', '{auto}'), GREATEST(COALESCE((SELECT MAX({auto}) FROM \"{name}\"), 0), 1))"
+                        )
+                await conn.execute(
+                    "INSERT INTO settings (key, value) VALUES ('pg_imported_from_sqlite', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    datetime.now().isoformat()
+                )
+        finally:
+            src.close()
+        print("[SYSTEM] 🐘 SQLite -> Postgres copy complete. Rows per table: " + ", ".join(summary))
+        for p in problems:
+            print(f"[WARNING] 🐘 {p}")
+        print(f"[SYSTEM] 🐘 The SQLite file was left untouched at {DB_PATH} — keep it as a backup.")
+    finally:
+        await conn.close()
+
+
+def pg_startup(schema_statements):
+    """Runs once at import, before the bot's own event loop exists."""
+    for sql in schema_statements:
+        _pg_translate_uncached(sql)  # learn primary keys / auto ids
+
+    async def _run():
+        await _pg_apply_schema(schema_statements)
+        await _pg_copy_from_sqlite()
+
+    try:
+        asyncio.run(_run())
+    except (OSError, asyncpg.PostgresError) as e:
+        raise SystemExit(
+            f"[CRITICAL] Couldn't set up the PostgreSQL database: {type(e).__name__}: {e}\n"
+            f"           Check DATABASE_URL in .env (user, password, host, database name), and that Postgres is running."
+        )
+    safe_url = re.sub(r"//([^:/@]+):[^@]*@", r"//\1:***@", DATABASE_URL)
+    print(f"[SYSTEM] 🐘 Database: PostgreSQL ({safe_url})")
+
+
 def db_connect():
     """Central connection factory — every DB connection in the codebase
     goes through here instead of calling aiosqlite.connect() directly,
@@ -206,6 +716,8 @@ def db_connect():
     pattern — people typing and clicking buttons at human speed, not
     concurrent machine-speed writes — without ever hanging noticeably if
     a lock genuinely can't clear."""
+    if USE_POSTGRES:
+        return _PgConnection()
     return _DbConnectWrapper(aiosqlite.connect(DB_PATH, timeout=10.0))
 
 RAID_JOIN_THRESHOLD = 5          # members joining...
@@ -217,7 +729,9 @@ TRANSLATE_COOLDOWN_SECONDS = 5   # per-user cooldown on the 🌐 reaction-transl
 # ============================================================
 def init_db():
     print("[SYSTEM] Initializing Robocop Database...")
-    with sqlite3.connect(DB_PATH) as conn:
+    global _schema_record
+    with _schema_connection() as conn:
+        _schema_record = conn
         cursor = conn.cursor()
 
         # WAL mode lets reads/writes interleave much more gracefully than the
@@ -509,9 +1023,13 @@ def init_db():
     print("[SYSTEM] 🤖 Database loaded successfully. Robocop's brain is online.")
 
 
+_schema_record = None
 migrate_legacy_db()
 init_db()
-print(f"[SYSTEM] 🗂️ Database file: {DB_PATH}")
+if USE_POSTGRES:
+    pg_startup(_schema_record.statements)
+else:
+    print(f"[SYSTEM] 🗂️ Database file: {DB_PATH}")
 
 # ============================================================
 #  2. BOT CLIENT
@@ -1740,7 +2258,7 @@ async def safe_step(guild, label: str, coro, default=None):
         detail = f"{type(e).__name__}: {e}"
         print(f"[ERROR] Startup step '{label}' failed for {getattr(guild, 'name', '?')}: {detail}")
         hint = ""
-        if isinstance(e, sqlite3.OperationalError) and any(k in str(e).lower() for k in ("disk i/o", "locked", "readonly", "unable to open")):
+        if not USE_POSTGRES and isinstance(e, sqlite3.OperationalError) and any(k in str(e).lower() for k in ("disk i/o", "locked", "readonly", "unable to open")):
             hint = (f"\nThis is a database *file* problem, not a logic bug. The DB is at `{DB_PATH}` — it must be on a local "
                     f"disk, not a Google Drive / OneDrive / Dropbox folder, and only one copy of the bot may run at a time.")
         try:

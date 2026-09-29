@@ -3,3 +3,4 @@ aiosqlite
 aiohttp
 python-dotenv
 tzdata  # timezone database for zoneinfo; Windows doesn't ship one
+asyncpg  # PostgreSQL driver - only used when DATABASE_URL is set in .env

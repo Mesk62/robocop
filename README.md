@@ -21,6 +21,8 @@ A Discord bot for a *Police Chief* mobile-game community. It welcomes newcomers,
 - **Game scores:** Rock-Paper-Scissors, Cops & Robbers, Rogue RoboCop and monthly standings.
 - **Moderation history, if any:** warnings, time-outs, kicks or bans and the reason given, and, if you're ever jailed, the roles you had so they can be handed back.
 
+**Where it's kept:** in a database on the owner's own machine — PostgreSQL, or a local SQLite file if no Postgres is configured. Nothing is sent to any outside database service.
+
 **It never collects** a real name, address, phone number, email, location or payment details, and it **doesn't save chat messages.** You can check all of this in `init_db()` in `main.py`, which creates every database table the bot has.
 
 ## What leaves the server
@@ -52,6 +54,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 # create a .env file containing:  DISCORD_TOKEN=...   (and optionally GOOGLE_API_KEY=...)
+# optional: DATABASE_URL=postgresql://user:password@localhost/robocop  to use PostgreSQL instead of SQLite
+#           (the first start copies an existing SQLite database across automatically)
 python main.py
 ```
 
