@@ -2441,11 +2441,12 @@ CONFIGURABLE_SETTINGS = {
     "founders_pass_max_server_size": {"default": 15, "type": int, "min": 0, "max": 200, "label": "Founder's Pass — only applies while total alliances are under this"},
     "nickname_maintenance_hour": {"default": 4, "type": int, "min": 0, "max": 23, "label": "Daily nickname maintenance hour (0-23, local time)"},
     "case_hour": {"default": 9, "type": int, "min": 0, "max": 23, "label": "Daily Case File hour (0-23, local time)"},
+    "bulletin_hours": {"default": 1, "type": int, "min": 0, "max": 24, "label": "Precinct Bulletin: post what's live every N hours (0 = off)"},
     "game_stats_hour": {"default": 18, "type": int, "min": 0, "max": 23, "label": "Weekly Precinct Report hour on Sundays (0-23, local time)"},
     "monthly_champion_hour": {"default": 0, "type": int, "min": 0, "max": 23, "label": "Monthly Champion announcement hour, on the 1st of each month (0-23, local time; 0 = midnight)"},
     "timezone": {"default": "America/Los_Angeles", "type": str, "label": "Server's operating timezone (IANA name, e.g. America/Los_Angeles)"},
     "innovator_max_grants": {"default": 50, "type": int, "min": 0, "max": 999999, "label": "Innovator badge — first N total registrants qualify"},
-    "innovator_max_multi_server_grants": {"default": 25, "type": int, "min": 0, "max": 999999, "label": "Innovator badge — first N registrants with more than 1 server ALSO qualify (separate pool, may overlap with the total pool)"},
+    "innovator_max_multi_server_grants": {"default": 25, "type": int, "min": 0, "max": 999999, "label": "Innovator badge — first N multi-server registrants also qualify (separate pool)"},
 }
 
 
@@ -2920,6 +2921,10 @@ async def compute_expected_role_order(guild) -> list:
     if stitch: ordered.append(stitch)
     if chrome: ordered.append(chrome)
     if silent: ordered.append(silent)
+    # (10.2) Colour roles the owner makes by hand (e.g. a personal colour for
+    # one member) sit right under the honorary badges, so their colour wins
+    # over the alliance rank colours. Kept in the order the owner arranged them.
+    ordered.extend(sorted((r for r in guild.roles if r.color.value and r.name not in approved_tags and _is_custom_role(guild, r)), key=lambda r: -r.position))
     ordered.extend(tag_r5s)
     ordered.extend(tag_r4s)
     ordered.extend(tag_r3s)
@@ -7780,6 +7785,7 @@ async def on_ready():
             await safe_step(guild, "retire chase recruit DMs", retire_chase_recruit_dms(guild))
             bot.loop.create_task(daily_chase_scheduler(guild))
             bot.loop.create_task(daily_case_scheduler(guild))
+            bot.loop.create_task(precinct_bulletin_scheduler(guild))
             bot.loop.create_task(chase_leaderboard_syndication_loop(guild))
             bot.loop.create_task(daily_nickname_maintenance_scheduler(guild))
             bot.loop.create_task(weekly_precinct_report_scheduler(guild))
@@ -7872,6 +7878,7 @@ async def on_guild_join(guild):
     await safe_step(guild, "retire chase recruit DMs", retire_chase_recruit_dms(guild))
     bot.loop.create_task(daily_chase_scheduler(guild))
     bot.loop.create_task(daily_case_scheduler(guild))
+    bot.loop.create_task(precinct_bulletin_scheduler(guild))
     bot.loop.create_task(chase_leaderboard_syndication_loop(guild))
     bot.loop.create_task(daily_nickname_maintenance_scheduler(guild))
     bot.loop.create_task(weekly_precinct_report_scheduler(guild))
@@ -8374,6 +8381,8 @@ def _is_custom_role(guild, role) -> bool:
         return False
     if any(r.name == f"{n}-R5" or r.name == f"{n}-R4" for r in guild.roles):
         return False  # an alliance tag role (has rank siblings)
+    if discord.utils.get(guild.categories, name=f"{n} CHATS"):
+        return False  # an alliance tag role (has its own channels), even before anyone holds a rank
     return True
 
 
@@ -11179,6 +11188,132 @@ async def check_case_answer(message) -> bool:
         pass
     await log_event(guild, f"🗂️ **CASE FILE SOLVED** by {message.author.mention} — **{answers[0]}**.")
     return True
+
+
+# ------------------------------------------------------------
+#  (10.2) THE PRECINCT BULLETIN — at the top of the hour, one silent post
+#  in everyone-chat: every game that's live right now, how to jump in, the
+#  prize, and a pointer to #🎮-how-to-play. Silent = shows in the channel,
+#  pings nobody. It replaces the previous bulletin (no stacking), and if
+#  nobody has spoken since the last one it's simply edited in place.
+# ------------------------------------------------------------
+def _ts(dt, style="R") -> str:
+    return f"<t:{int(dt.timestamp())}:{style}>"
+
+
+async def build_bulletin_embed(guild):
+    now = datetime.now()
+    tz = await get_guild_timezone(guild.id)
+    prize = await get_guild_setting(guild.id, "monthly_prize") or DEFAULT_MONTHLY_PRIZE
+    embed = discord.Embed(
+        title="📻 PRECINCT BULLETIN",
+        description=(f"🏆 **This month's prize: {prize}** — highest points on the 1st takes it. Everyone's in, nothing to join.\n"
+                     f"🎮 **The games:** 🚔 Cops & Robbers (daily manhunt) · 🗂️ Case File (a riddle a day) · 🕵️ Rogue RoboCop (hide & seek) · ✂️ `/rps` (for glory)\n"
+                     f"📖 How each one works: **#{CH_GAMES}**"),
+        color=discord.Color.dark_blue(), timestamp=now)
+    live = 0
+
+    # 🗂️ Case File
+    st = await _case_state(guild)
+    if st and not st.get("solved_by") and st.get("q"):
+        embed.add_field(name="🗂️ Case File — OPEN", value=f"**{st['q'][:700]}**\nJust type your answer in this channel. First right answer: **{ACHIEVEMENT_WEIGHTS['case_solved']} points**.", inline=False)
+        live += 1
+    else:
+        hour = await get_config_value(guild.id, "case_hour")
+        nxt = datetime.now(tz).replace(hour=hour, minute=0, second=0, microsecond=0)
+        if nxt <= datetime.now(tz):
+            nxt += timedelta(days=1)
+        solver = guild.get_member(int(st["solved_by"])) if st and str(st.get("solved_by", "")).isdigit() else None
+        done = f"Today's was cracked by **{solver.display_name}**. " if solver else ""
+        embed.add_field(name="🗂️ Case File", value=f"{done}Next riddle {_ts(nxt)}.", inline=False)
+
+    # 🕵️ Rogue RoboCop
+    rogue = await get_active_rogue_round(guild)
+    if rogue:
+        ends = datetime.fromisoformat(rogue[2])
+        embed.add_field(name="🕵️ Rogue RoboCop — HIDING IN THIS CHANNEL",
+                        value=f"It talks now and then, and every line is a clue. `/catch name:<guess>` — {ROGUE_CATCHES_PER_PERSON} tries each, "
+                              f"**{ACHIEVEMENT_WEIGHTS['rogue_catch']} points** to whoever nails it. Slips away {_ts(ends)}.", inline=False)
+        live += 1
+
+    # 🚔 Cops & Robbers
+    chase = await get_active_chase_round(guild)
+    if chase:
+        round_id, ends_str, tier = chase
+        async with db_connect() as conn:
+            cur = await conn.cursor()
+            await cur.execute("SELECT COUNT(*) FROM chase_participants WHERE round_id = ? AND role = 'robber' AND eliminated = 0", (round_id,))
+            free = (await cur.fetchone())[0]
+            await cur.execute("SELECT COUNT(*) FROM chase_participants WHERE round_id = ? AND role = 'cop' AND eliminated = 0", (round_id,))
+            cops = (await cur.fetchone())[0]
+        embed.add_field(name="🚔 Cops & Robbers — ROUND IN PROGRESS",
+                        value=f"**{free}** robber(s) still free · **{cops}** cop(s) on patrol · clue **{tier}/{CHASE_HINT_TIERS}** dropped · ends {_ts(datetime.fromisoformat(ends_str))}.\n"
+                              f"Drafted? Your role is in a private thread in this channel. Cops `/arrest`, robbers `/ambush`. `/chase` tells you if you're in.", inline=False)
+        live += 1
+    else:
+        hour = await get_config_value(guild.id, "chase_start_hour")
+        nxt = datetime.now(tz).replace(hour=hour, minute=0, second=0, microsecond=0)
+        if nxt <= datetime.now(tz):
+            nxt += timedelta(days=1)
+        embed.add_field(name="🚔 Cops & Robbers", value=f"Next manhunt {_ts(nxt)} — everyone's in automatically, roles arrive in a private thread.", inline=False)
+
+    standings = await compute_monthly_champion_standings(guild)
+    if standings:
+        top3 = " · ".join(f"{MEDAL_LABEL[i]} {guild.get_member(uid).display_name if guild.get_member(uid) else '?'} ({pts})" for i, (uid, pts, _) in enumerate(standings[:3]))
+        embed.add_field(name="📊 This month's race", value=f"{top3}\nYour score: `/stats` · {SCORING_LINE}", inline=False)
+    else:
+        embed.add_field(name="📊 This month's race", value=f"Nobody's scored yet — first move wins the lead. Your score: `/stats` · {SCORING_LINE}", inline=False)
+    embed.add_field(name="❓ Lost?", value="Ask `@RoboCop how do I…?` right here, or `/help`.", inline=False)
+    embed.set_footer(text=(f"{live} game(s) live right now · " if live else "Quiet hour — next games above · ") + boss_quip(guild))
+    return embed
+
+
+async def post_precinct_bulletin(guild):
+    ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
+    if not ch:
+        return
+    embed = await build_bulletin_embed(guild)
+    old_id = await get_guild_setting(guild.id, "bulletin_msg_id")
+    old = None
+    if old_id:
+        try:
+            old = await ch.fetch_message(int(old_id))
+        except (discord.HTTPException, ValueError):
+            old = None
+    if old is not None and ch.last_message_id == old.id:
+        try:
+            await old.edit(embed=embed)  # nobody spoke since — just refresh it
+            return
+        except discord.HTTPException:
+            pass
+    try:
+        msg = await ch.send(embed=embed, silent=True)  # in the channel, no ping
+    except discord.HTTPException as e:
+        await report_error(guild, "posting the Precinct Bulletin", None, e)
+        return
+    await set_guild_setting(guild.id, "bulletin_msg_id", str(msg.id))
+    if old is not None:
+        try:
+            await old.delete()  # never more than one bulletin in the channel
+        except discord.HTTPException:
+            pass
+
+
+async def precinct_bulletin_scheduler(guild):
+    """Top of every N hours (`/settings bulletin_hours`, 0 = off)."""
+    while True:
+        try:
+            now = datetime.now()
+            await asyncio.sleep(max(5.0, 3600 - (now.minute * 60 + now.second) + 20))  # ~20 s past the hour
+            every = await get_config_value(guild.id, "bulletin_hours")
+            if not every or not _is_leader or server_is_busy():
+                continue
+            if datetime.now().hour % every:
+                continue
+            await post_precinct_bulletin(guild)
+        except Exception as e:
+            print(f"[ERROR] Precinct Bulletin scheduler hit an error, will retry next hour: {e}")
+            await asyncio.sleep(60)
 
 
 async def daily_case_scheduler(guild):
@@ -15488,6 +15623,9 @@ HOWDO_TASKS = [
     ("How the games work", "everyone", "how do games work rules how to play cops robbers rogue case file explain game instructions",
      f"Everything is pinned in #{CH_GAMES}: Cops & Robbers (secret roles in private threads, {CHASE_HINT_TIERS} clues, {CHASE_ARRESTS_PER_ROUND} arrests / {CHASE_AMBUSHES_PER_ROUND} ambushes each), "
      f"Rogue RoboCop (`/catch`, {ROGUE_CATCHES_PER_PERSON} tries), the Daily Case File (type the answer in chat) and RPS (for fun)."),
+    ("The hourly Precinct Bulletin", "staff", "bulletin hourly announcement what's live games status every hour turn off bulletin",
+     "Every hour RoboCop posts one silent bulletin in #🌍-everyone-chat (open Case File, Rogue, chase status, prize). It replaces the last one, so it never stacks. "
+     "Change how often: `/settings setting:bulletin_hours value:2` (every 2 hours) — `0` turns it off."),
     ("Post a new Case File (riddle)", "staff", "start new case file post another riddle puzzle fresh case trigger case file now",
      "`/game action:start game:case` → tap **Start now**. Any open case is revealed first, then a fresh riddle posts in #🌍-everyone-chat. "
      "`/game action:end game:case` just reveals the answer. The 9am case still runs on its own (`/settings setting:case_hour` changes the time)."),
