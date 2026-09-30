@@ -9,7 +9,7 @@ A Discord bot for a *Police Chief* mobile-game community. It welcomes newcomers,
 - **Onboarding** — new members answer a few questions in a private `#gateway` channel (language, in-game name, alliance tag, game server) and get the matching roles and nickname.
 - **Alliances and ranks** — alliance roles and channels, R4/R5 rank requests with staff approval.
 - **Translation** — react 🌐 to any message for a private translation.
-- **Games** — Rock-Paper-Scissors, Cops & Robbers (opt-in: you're only drafted or messaged about it if you join the roster), Rogue RoboCop, with leaderboards.
+- **Games** — Rock-Paper-Scissors, Cops & Robbers (everyone registered is drafted in rotation — up to 12 per round, recent chatters first, *Not for me* opts out; roles are revealed in private threads, with a DM only as a fallback), Rogue RoboCop, the Daily Case File (a riddle a day), with leaderboards. Rules are auto-posted in `#🎮-how-to-play`.
 - **Quiet by design** — it only DMs you about things you asked for or that concern you (your registration, a rank request, a warning, a game you joined). No "welcome back" nudges, no daily digests when nothing happened.
 - **Moderation** — warnings, timeouts, a "prison" channel, bans and kicks, every one logged with an undo button.
 - **Fresh start** — staff can wipe everything the bot stores about one person (and lift their ban) with one click, so they can register again from scratch — optionally with a one-use invite sent to them.
@@ -24,7 +24,8 @@ Passwords, login codes, account emails, or payment — ever. If anything claimin
 - **What you tell it:** your in-game name (one per game server, if they differ), alliance tag, game server number(s), language, and a rough time zone only if you choose to share it.
 - **Your Discord ID and username**, so it recognises you if you leave and come back.
 - **Your place in the server:** rank (R4/R5), rank requests, badges like Innovator, and which registration steps you've finished.
-- **Game scores:** Rock-Paper-Scissors, Cops & Robbers, Rogue RoboCop and monthly standings.
+- **Game scores:** Rock-Paper-Scissors, Cops & Robbers, Rogue RoboCop, Daily Case File solves and monthly standings, plus guesses used in the current round (`chase_participants.guesses_used`, `rogue_guesses`), and two rotation counters per player (`chase_stats.last_drafted_round`, `chase_stats.no_show_streak`) so quiet members get their turn and no-shows go to the back of the queue.
+- **The date you last posted** (`users.last_active_at`, day-level, no message content) — only used to put recent chatters at the front of the Cops & Robbers draft.
 - **Moderation history, if any:** warnings, time-outs, kicks or bans and the reason given, and, if you're ever jailed, the roles you had so they can be handed back.
 
 **Where it's kept:** in a database on the owner's own machine — PostgreSQL, or a local SQLite file if no Postgres is configured. Nothing is sent to any outside database service.
@@ -48,7 +49,7 @@ Passwords, login codes, account emails, or payment — ever. If anything claimin
 
 - **Server Members, Message Content and Presence intents** — to welcome new members, read answers typed in `#gateway`, and greet top-10 players / staff when they come online.
 - **Manage Roles, Nicknames and Channels** — to set up alliances, ranks and nicknames.
-- **Create Private Threads, Send Messages in Threads, Manage Threads** — each Cops & Robbers round gets a private cops-only thread for the hourly clues (instead of a DM per cop per hour). Without these it falls back to DMs.
+- **Create Private Threads, Send Messages in Threads, Manage Threads** — each Cops & Robbers round gets two private threads — one for the cops (clues) and one for the robbers — instead of DMs. Without these it falls back to DMs.
 - **Kick, Ban, Moderate Members, Manage Messages** — moderation tools, used by staff commands (and a few automatic safety rules, all logged). Manage Messages also lets staff pin the `/safety` notice.
 - **View Audit Log** — so the `#visitors` log can tell "left" apart from "kicked" or "banned".
 - **Create Invite** — only for the staff "fresh start + invite back" button, which makes a one-use, 7-day invite for one person.
@@ -68,5 +69,7 @@ pip install -r requirements.txt
 #           (the first start copies an existing SQLite database across automatically)
 python main.py
 ```
+
+Game messages include a running gag at the server owner's expense — the name is read from the server's owner at runtime, nothing is stored.
 
 Questions? Ask **Mesk** in the server.
