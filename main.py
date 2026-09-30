@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import hashlib
 import time
 import uuid
 import random
@@ -1104,6 +1105,8 @@ intents.presences = True
 
 bot = commands.Bot(command_prefix="Robocop ", intents=intents)
 bot.infra_ready_guilds = set()   # guards against re-running infra setup on every reconnect
+bot._startup_checks_done = set()  # (10.2) guilds whose full startup checks already ran this process
+bot._startup_nick_incomplete = {}  # (10.2) guild id → members holding a tag but no server role (for the diagnostic)
 bot.http_session = None          # shared aiohttp session, created lazily
 
 # Raid-detection state
@@ -1923,12 +1926,48 @@ CH_EVERYONE = "🌍-everyone-chat"
 CH_EVERYONE_LEGACY = "💬-general-chat"
 CAT_EVERYONE = "🌍 EVERYONE · ALL SERVERS · ALL ALLIANCES"
 CH_EVERYONE_TOPIC = "🌍 THE chat for everyone — every game server, every alliance, one room. New arrivals get a welcome rhyme here. Alliance-only talk lives in your alliance's own channels."
+# ------------------------------------------------------------
+#  (10.2) VISUAL SYSTEM — so an event never looks like the hourly bulletin.
+#  Discord can't flash or animate a sidebar. What it CAN do: one colour per
+#  family (the eye learns it), a big "# header" line ABOVE the embed (the
+#  largest text Discord renders — and it's what notifications/previews
+#  show), a "## subheading" inside, and a reaction stamp on the post.
+#  Families:  Case File = hot orange · Cops & Robbers = siren red ·
+#  Rogue = purple · prize/leaderboards/champions = gold · newcomers &
+#  promotions = green · weekly report = teal · bulletin = quiet navy.
+# ------------------------------------------------------------
+COLOR_CASE = discord.Color(0xFF6D00)
+COLOR_CHASE = discord.Color(0xE53935)
+COLOR_ROGUE = discord.Color(0x8E24AA)
+COLOR_SCORE = discord.Color.gold()
+COLOR_BULLETIN = discord.Color(0x1F3A5F)
+COLOR_REPORT = discord.Color(0x00897B)
+COLOR_WELCOME = discord.Color(0x43A047)
+
+
+def event_header(title: str, sub: str = "") -> str:
+    """The big line above an event embed."""
+    return f"# {title}" + (f"\n-# {sub}" if sub else "")
+
+
+async def stamp(msg, *emojis):
+    """Reaction 'stamp' on an event post — a visual marker the bulletin never gets."""
+    if not msg:
+        return
+    for e in emojis:
+        try:
+            await msg.add_reaction(e)
+        except discord.HTTPException:
+            break
+
+
 CH_EVERYONE_NOTICE = (
     "🌍 **THIS IS THE CHAT FOR EVERYONE.**\n"
     "Every game server, every alliance, one room. Say hi, trade tips, talk trash (nicely).\n"
     "• Cops & Robbers runs here daily, the Rogue RoboCop hides here, and the Daily Case File drops here. How they work: **#🎮-how-to-play**.\n"
     "• Your alliance's private talk lives in your own `[TAG] CHATS` channels.\n"
-    "• New here? `/help` shows everything you can do, and **#⚙️-settings** is where you personalise things (language, time zone, name)."
+    "• New here? `/help` shows everything you can do, and **#⚙️-settings** is where you personalise things (language, time zone, name).\n"
+    "• **Buttons below:** challenge someone to RPS, see today's Case File, check if you're in the chase, or your score — one tap, no commands."
 )
 # Green here is deliberately a "something's off" signal, not a normal
 # resting state — anyone with an alliance should show that alliance's
@@ -2997,11 +3036,29 @@ async def compute_expected_role_order(guild) -> list:
     return ordered
 
 
+async def ensure_overwrite(channel, target, **wanted) -> bool:
+    """(10.2) Apply a permission overwrite ONLY if the cached one differs —
+    startup used to re-send ~17 identical overwrites every boot, each one a
+    request against Discord's rate limit. Returns True if it sent anything."""
+    current = channel.overwrites_for(target)
+    if all(getattr(current, k) is v for k, v in wanted.items()):
+        return False
+    await channel.set_permissions(target, **wanted)
+    return True
+
+
+def _roles_already_ordered(ordered: list, bot_pos: int) -> bool:
+    positions = [r.position for r in ordered if r.position < bot_pos]
+    return all(positions[i] > positions[i + 1] for i in range(len(positions) - 1))
+
+
 async def enforce_role_hierarchy(guild):
     if not guild.me.top_role:
         return
     bot_pos = guild.me.top_role.position
     ordered = await compute_expected_role_order(guild)
+    if _roles_already_ordered(ordered, bot_pos):
+        return  # (10.2) already in order — nothing to send (this used to PATCH every role every boot)
 
     updates = {}
     current_pos = bot_pos - 1
@@ -3535,7 +3592,8 @@ async def refresh_leadership_status(guild, tag: str):
         status_text = (
             f"🔒 **[{tag}] LEADERSHIP CHAT**\n"
             f"R4, R5, and anyone else the R5 has trusted with access can post here. Ask your R5 if you think "
-            f"you should be here but aren't."
+            f"you should be here but aren't.\n"
+            f"🎛️ **R5 desk:** the buttons below run your alliance — leadership access, announcements, rename, roster. Tap ❓ for the tour."
         )
     else:
         status_text = (
@@ -3565,12 +3623,13 @@ async def refresh_leadership_status(guild, tag: str):
 
     if msg:
         try:
-            await msg.edit(content=status_text)
+            if msg.content != status_text or not msg.components:
+                await msg.edit(content=status_text, view=AllianceDeskView())
         except discord.HTTPException:
             pass
     else:
         try:
-            msg = await leadership_chat.send(status_text)
+            msg = await leadership_chat.send(status_text, view=AllianceDeskView())
             try:
                 await msg.pin()
             except discord.HTTPException:
@@ -4329,9 +4388,13 @@ async def post_latest_version_report(guild, repairs: list):
         pass
 
 
-async def post_startup_report(guild, repairs: list, trigger_reason: str, ungoverned_members: list = None):
+async def post_startup_report(guild, repairs: list, trigger_reason: str, ungoverned_members: list = None,
+                              notes: list = None, online_line: str = ""):
     """Golden-rule logging: every single startup or re-join gets a report,
-    even a completely uneventful one."""
+    even a completely uneventful one — but exactly ONE post. (10.2) The old
+    separate "ROBOCOP IS ONLINE", "database already matches" and "every
+    nickname already matches" messages are folded in here as lines, so a
+    quiet boot costs one request to #logs instead of four."""
     ungoverned_members = ungoverned_members or []
     log_channel = discord.utils.get(guild.channels, name="logs")
     if not log_channel:
@@ -4343,6 +4406,12 @@ async def post_startup_report(guild, repairs: list, trigger_reason: str, ungover
     else:
         body = "✅ Everything checked out. All tracked roles, categories, and channels are present, and I didn't touch a single one of your customizations."
         color = discord.Color.green()
+    if notes:
+        body += "\n\n" + "\n".join(notes)
+    if online_line:
+        body = online_line + "\n\n" + body
+    if len(body) > 4000:
+        body = body[:3990] + "\n…(truncated)"
 
     embed = discord.Embed(
         title=f"🩺 STARTUP DIAGNOSTIC — {trigger_reason}",
@@ -4784,8 +4853,8 @@ async def reconcile_database_from_server(guild) -> list:
 
     if repairs:
         await log_event(guild, f"🗂️ **STARTUP INVENTORY — {len(repairs)} record(s) rebuilt from the live server**\n" + "\n".join(f"• {r}" for r in repairs))
-    else:
-        await log_event(guild, "🗂️ **STARTUP INVENTORY** — database already matches the live server. Nothing to rebuild.")
+    # (10.2) Nothing to rebuild → no post of its own; the startup diagnostic
+    # reports it in one line.
     return repairs
 
 
@@ -4793,43 +4862,50 @@ async def startup_nickname_enforcement(guild) -> list:
     """Every startup: compute what each alliance member's nickname SHOULD be
     from their live roles + DB name, and fix any that don't match — no
     command needed. Every change (and every one I couldn't make, e.g. a
-    member ranked above me) is logged to #logs."""
-    async with server_busy("booting up and checking nicknames", quiet=True):
-        async with db_connect() as conn:
-            cur = await conn.cursor()
-            await cur.execute("SELECT tag FROM alliances")
-            approved_tags = {row[0] for row in await cur.fetchall()}
-            await cur.execute("SELECT user_id, in_game_name FROM users")
-            in_game_names = {row[0]: row[1] for row in await cur.fetchall()}
-        managed = await get_managed_servers(guild.id)
+    member ranked above me) is logged to #logs.
 
-        fixed, blocked, incomplete = [], [], 0
-        for m in guild.members:
-            if m.bot or not any(r.name in approved_tags for r in m.roles):
-                continue
-            expected = await compute_expected_nickname(m, approved_tags, in_game_names, managed)
-            if expected is None:
-                incomplete += 1
-                continue
-            before = m.display_name
-            if before.strip() == expected:
-                continue
-            try:
-                await m.edit(nick=expected[:32], reason="Startup nickname enforcement")
-                fixed.append(f"✏️ {m.mention}: `{before}` → `{expected}`")
-            except discord.Forbidden:
-                blocked.append(f"🚫 {m.mention}: should be `{expected}` — I can't edit them (ranked above me); needs a manual fix")
-            except discord.HTTPException as e:
-                blocked.append(f"⚠️ {m.mention}: should be `{expected}` — Discord refused (`{e}`)")
+    (10.2) The comparison is pure reading — no Discord requests, no busy
+    gate. Only if something actually needs editing do we go "busy" and
+    touch Discord; a clean boot posts nothing here (the startup diagnostic
+    carries the one-line summary)."""
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        await cur.execute("SELECT tag FROM alliances")
+        approved_tags = {row[0] for row in await cur.fetchall()}
+        await cur.execute("SELECT user_id, in_game_name FROM users")
+        in_game_names = {row[0]: row[1] for row in await cur.fetchall()}
+    managed = await get_managed_servers(guild.id)
 
-        if not fixed and not blocked:
-            await log_event(guild, f"✅ **STARTUP NICKNAME CHECK** — every alliance member's nickname already matches their roles." + (f" ({incomplete} hold a tag but no server role — nothing to compute.)" if incomplete else ""))
-        else:
-            header = f"✏️ **STARTUP NICKNAME CHECK — {len(fixed)} fixed, {len(blocked)} need a human**"
-            if incomplete:
-                header += f" ({incomplete} hold a tag but no server role — skipped)"
-            await log_event(guild, header + "\n" + "\n".join(fixed + blocked))
-        return fixed
+    todo, incomplete = [], 0
+    for m in guild.members:
+        if m.bot or not any(r.name in approved_tags for r in m.roles):
+            continue
+        expected = await compute_expected_nickname(m, approved_tags, in_game_names, managed)
+        if expected is None:
+            incomplete += 1
+            continue
+        before = m.display_name
+        if before.strip() != expected:
+            todo.append((m, before, expected))
+
+    fixed, blocked = [], []
+    if todo:
+        async with server_busy("booting up and fixing nicknames", quiet=True):
+            for m, before, expected in todo:
+                try:
+                    await m.edit(nick=expected[:32], reason="Startup nickname enforcement")
+                    fixed.append(f"✏️ {m.mention}: `{before}` → `{expected}`")
+                except discord.Forbidden:
+                    blocked.append(f"🚫 {m.mention}: should be `{expected}` — I can't edit them (ranked above me); needs a manual fix")
+                except discord.HTTPException as e:
+                    blocked.append(f"⚠️ {m.mention}: should be `{expected}` — Discord refused (`{e}`)")
+
+        header = f"✏️ **STARTUP NICKNAME CHECK — {len(fixed)} fixed, {len(blocked)} need a human**"
+        if incomplete:
+            header += f" ({incomplete} hold a tag but no server role — skipped)"
+        await log_event(guild, header + "\n" + "\n".join(fixed + blocked))
+    bot._startup_nick_incomplete[guild.id] = incomplete
+    return fixed
 
 
 # ------------------------------------------------------------
@@ -5121,30 +5197,26 @@ async def sync_abilities_channel_reference(guild, abilities_ch):
 
     stored_raw = await get_setting(settings_key)
     stored_ids = json.loads(stored_raw) if stored_raw else []
+    digest = hashlib.sha1("\n---\n".join(chunks).encode("utf-8")).hexdigest()
+    if stored_ids and await get_setting(settings_key + "_hash") == digest:
+        return  # (10.2) the command list only changes on a release — nothing to send
     if not stored_ids:  # wiped DB: adopt RoboCop's own pinned list in this channel, oldest first
         try:
             stored_ids = [m.id for m in sorted((m for m in await _pinned_messages(abilities_ch) if m.author.id == guild.me.id and "COMMAND REFERENCE" in (m.content or "")), key=lambda m: m.created_at)]
         except (discord.Forbidden, discord.HTTPException):
             stored_ids = []
 
-    old_messages = []
-    for mid in stored_ids:
-        try:
-            old_messages.append(await abilities_ch.fetch_message(mid))
-        except (discord.NotFound, discord.HTTPException):
-            old_messages.append(None)
-
     new_ids = []
     for idx, content in enumerate(chunks):
         view = AbilitiesReferenceView() if idx == 0 else None
-        existing = old_messages[idx] if idx < len(old_messages) else None
-        if existing:
+        existing_id = stored_ids[idx] if idx < len(stored_ids) else None
+        if existing_id:
             try:
-                await existing.edit(content=content, view=view)
-                new_ids.append(existing.id)
+                await abilities_ch.get_partial_message(existing_id).edit(content=content, view=view)  # PATCH only, no GET
+                new_ids.append(existing_id)
                 continue
             except discord.HTTPException:
-                pass  # fall through to posting fresh below
+                pass  # deleted or failed — post fresh below
         try:
             msg = await abilities_ch.send(content=content, view=view)
             await msg.pin()
@@ -5153,14 +5225,14 @@ async def sync_abilities_channel_reference(guild, abilities_ch):
             pass
 
     # Clean up any leftover messages from a previous, longer version of the list.
-    for extra in old_messages[len(chunks):]:
-        if extra:
-            try:
-                await extra.delete()
-            except discord.HTTPException:
-                pass
+    for extra_id in stored_ids[len(chunks):]:
+        try:
+            await abilities_ch.get_partial_message(extra_id).delete()
+        except discord.HTTPException:
+            pass
 
     await set_setting(settings_key, json.dumps(new_ids))
+    await set_setting(settings_key + "_hash", digest)
 
 
 class AbilitiesReferenceView(discord.ui.View):
@@ -5291,6 +5363,9 @@ async def restore_persistent_views():
     bot.add_view(ChaseRosterView())
     bot.add_view(GamePingsView())  # (10.2) the 🔕 button on game heads-ups  # persists every "Count me in" button (announcements, settings, invite DMs)
     bot.add_view(MemberRescueView())  # persists the 🔄 Fresh start buttons on every trouble post
+    bot.add_view(StaffDeskView())     # (10.2) #🛠️-precinct-desk
+    bot.add_view(AllianceDeskView())  # (10.2) each alliance's leadership-chat desk
+    bot.add_view(PlayPanelView())     # (10.2) the games buttons on the everyone-chat notice
 
     cutoff = (datetime.now() - timedelta(days=14)).isoformat()
     async with db_connect() as conn:
@@ -6032,7 +6107,8 @@ CH_SETTINGS_NOTICE = (
     "🌐 **Translate anything** — react with 🌐 on any message and I'll DM you a translation. Nothing to set up.\n"
     "🛡️ **What I keep about you** — the full, honest list, and what I'll never ask for. (`/safety`)\n"
     "📊 **Your score & the prize** — your record, this month's race and every leaderboard, one tap each. (`/stats`)\n"
-    "❓ **Everything you can do** — your personal rundown, updated as you gain roles. (`/help`)"
+    "❓ **Everything you can do** — your personal rundown, updated as you gain roles. (`/help`)\n"
+    "🖱️ Staff have their own buttons in **#🛠️-precinct-desk**; alliance R5s have theirs pinned in their 🎖️-leadership-chat."
 )
 
 
@@ -6152,7 +6228,17 @@ class SettingsPanelView(discord.ui.View):
         if await self._guard(interaction):
             await stats_cmd(interaction)
 
-    @discord.ui.button(label="Cops & Robbers: in or out", style=discord.ButtonStyle.secondary, emoji="🕵️", custom_id="rc_settings_chase")
+    @discord.ui.button(label="Safety & privacy", style=discord.ButtonStyle.secondary, emoji="🛡️", custom_id="rc_settings_safety", row=1)
+    async def safety_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await safety.callback(interaction, False)
+
+    @discord.ui.button(label="Everything I can do", style=discord.ButtonStyle.secondary, emoji="❓", custom_id="rc_settings_help", row=1)
+    async def help_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await help_cmd.callback(interaction, None, False)
+
+    @discord.ui.button(label="Cops & Robbers: in or out", style=discord.ButtonStyle.secondary, emoji="🕵️", custom_id="rc_settings_chase", row=1)
     async def chase(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._guard(interaction):
             return
@@ -6186,29 +6272,59 @@ async def find_own_pinned(channel, marker: str):
     return None
 
 
+_notice_hash_keys = {}  # (10.2) pinned-notice message id → its content-hash setting key
+
+
+@bot.event
+async def on_raw_message_delete(payload):
+    """(10.2) If someone deletes one of RoboCop's pinned notices, forget its
+    content hash so the next startup reposts it instead of assuming it's
+    still there."""
+    hkey = _notice_hash_keys.pop(payload.message_id, None)
+    if hkey:
+        try:
+            await set_setting(hkey, "")
+        except Exception as e:
+            print(f"[WARNING] Couldn't forget notice hash {hkey}: {e}")
+
+
 async def ensure_pinned_notice(guild, channel, settings_key: str, content: str, view=None):
     """Keeps ONE pinned bot message at the top of a channel current: edits it
     in place across restarts, reposts + re-pins only if it was deleted.
     If the database forgot the message id (wiped DB), the existing pin is
     found by its first line and adopted."""
     key = f"{settings_key}_{guild.id}"
+    hkey = f"{settings_key}_hash_{guild.id}"
+    digest = hashlib.sha1(content.encode("utf-8")).hexdigest()
     stored = await get_setting(key)
-    msg = None
+    # (10.2) Nothing changed since last boot → zero requests. Persistent
+    # views are kept alive by bot.add_view() at startup, so the message
+    # never needs re-editing just to re-attach its buttons. If a human
+    # deletes the notice, on_raw_message_delete forgets the hash so the
+    # next boot reposts it.
+    if stored and await get_setting(hkey) == digest:
+        _notice_hash_keys[int(stored)] = hkey
+        return channel.get_partial_message(int(stored))
     if stored:
         try:
-            msg = await channel.fetch_message(int(stored))
-        except (discord.NotFound, discord.HTTPException, ValueError):
-            msg = None
-    if msg is None:
-        msg = await find_own_pinned(channel, content.split("\n", 1)[0][:60])
-        if msg:
-            await set_setting(key, str(msg.id))
+            await channel.get_partial_message(int(stored)).edit(content=content, view=view)  # one PATCH, no GET
+            await set_setting(hkey, digest)
+            _notice_hash_keys[int(stored)] = hkey
+            return channel.get_partial_message(int(stored))
+        except discord.NotFound:
+            pass  # deleted — repost below
+        except (discord.HTTPException, ValueError):
+            pass
+    msg = await find_own_pinned(channel, content.split("\n", 1)[0][:60])
     if msg:
-        if msg.content != content or view is not None:
+        await set_setting(key, str(msg.id))
+        if msg.content != content:
             try:
                 await msg.edit(content=content, view=view)
             except discord.HTTPException:
                 pass
+        await set_setting(hkey, digest)
+        _notice_hash_keys[msg.id] = hkey
         return msg
     try:
         msg = await channel.send(content, view=view)
@@ -6217,6 +6333,8 @@ async def ensure_pinned_notice(guild, channel, settings_key: str, content: str, 
         except discord.HTTPException:
             pass
         await set_setting(key, str(msg.id))
+        await set_setting(hkey, digest)
+        _notice_hash_keys[msg.id] = hkey
         return msg
     except discord.HTTPException as e:
         print(f"[WARNING] Couldn't post the pinned notice in #{channel.name}: {e}")
@@ -6307,16 +6425,16 @@ async def build_global_infrastructure(guild):
     if not admin_cat:
         admin_cat = await guild.create_category("Admin-Only")
         repairs.append("🗄️ Category **Admin-Only** didn't exist — recreated to house #gateway and #logs.")
-    await admin_cat.set_permissions(guild.default_role, read_messages=False, view_channel=False)
+    await ensure_overwrite(admin_cat, guild.default_role, read_messages=False, view_channel=False)
     for staff_role in (judge_role, stitch_role, millie_role, chrome_role, silent_role, senator_role, dictator_role):
-        await admin_cat.set_permissions(staff_role, view_channel=True, read_messages=True, send_messages=True)
+        await ensure_overwrite(admin_cat, staff_role, view_channel=True, read_messages=True, send_messages=True)
 
     gateway_ch = discord.utils.get(guild.channels, name="gateway")
     if not gateway_ch:
         await guild.create_text_channel("gateway", category=admin_cat, overwrites={guild.default_role: discord.PermissionOverwrite(read_messages=False, view_channel=False)})
         repairs.append("🚪 Channel **#gateway** didn't exist — recreated it, since onboarding runs there.")
     else:
-        await gateway_ch.set_permissions(guild.default_role, read_messages=False, view_channel=False)
+        await ensure_overwrite(gateway_ch, guild.default_role, read_messages=False, view_channel=False)
 
     if not discord.utils.get(guild.channels, name="logs"):
         await guild.create_text_channel("logs", category=admin_cat)
@@ -6329,6 +6447,16 @@ async def build_global_infrastructure(guild):
     if not discord.utils.get(guild.channels, name="latest-version"):
         await guild.create_text_channel("latest-version", category=admin_cat)
         repairs.append("🆕 Channel **#latest-version** didn't exist — recreated it (inconsistencies found after an update get logged here).")
+
+    # 🛠️ (10.2) The precinct desk — every staff control as a button.
+    desk_ch = discord.utils.get(guild.channels, name=CH_DESK)
+    if not desk_ch:
+        desk_ch = await guild.create_text_channel(CH_DESK, category=admin_cat, topic=CH_DESK_TOPIC)
+        repairs.append(f"🛠️ Channel **#{CH_DESK}** didn't exist — created it and pinned the staff buttons.")
+    try:
+        await ensure_pinned_notice(guild, desk_ch, "desk_notice_msg_id", CH_DESK_NOTICE, view=StaffDeskView())
+    except Exception as e:
+        print(f"[ERROR] Failed to pin the precinct desk: {e}")
 
     # ------------------------------------------------------------
     #  📌 POLICE CHIEF INFO — announcements, rules, bugs, suggestions.
@@ -6375,9 +6503,9 @@ async def build_global_infrastructure(guild):
                 await announcements_ch.edit(category=info_cat)
             except discord.Forbidden:
                 pass
-        await announcements_ch.set_permissions(guild.default_role, view_channel=True, send_messages=False)
+        await ensure_overwrite(announcements_ch, guild.default_role, view_channel=True, send_messages=False)
         for staff_role in (judge_role, senator_role, dictator_role):
-            await announcements_ch.set_permissions(staff_role, send_messages=True)
+            await ensure_overwrite(announcements_ch, staff_role, send_messages=True)
 
     rules_ch = discord.utils.find(
         lambda c: isinstance(c, discord.TextChannel) and "rule" in c.name.lower(), guild.channels
@@ -6391,9 +6519,9 @@ async def build_global_infrastructure(guild):
                 await rules_ch.edit(category=info_cat)
             except discord.Forbidden:
                 pass
-        await rules_ch.set_permissions(guild.default_role, view_channel=True, send_messages=False)
+        await ensure_overwrite(rules_ch, guild.default_role, view_channel=True, send_messages=False)
         for staff_role in (judge_role, senator_role, dictator_role):
-            await rules_ch.set_permissions(staff_role, send_messages=True)
+            await ensure_overwrite(rules_ch, staff_role, send_messages=True)
 
     # 🐛 #bugs and 💡 #suggestions — the opposite of read-only: any
     # registered Member can post here. Anything posted gets mirrored to
@@ -6521,7 +6649,7 @@ async def build_global_infrastructure(guild):
             await general_chat_ch.edit(category=everyone_cat, topic=CH_EVERYONE_TOPIC, position=0)
     except discord.HTTPException as e:
         print(f"[WARNING] Couldn't move/describe #{CH_EVERYONE}: {e}")
-    await ensure_pinned_notice(guild, general_chat_ch, "everyone_notice_msg_id", CH_EVERYONE_NOTICE)
+    await ensure_pinned_notice(guild, general_chat_ch, "everyone_notice_msg_id", CH_EVERYONE_NOTICE, view=PlayPanelView())
 
     # 🌟 Innovator-only lounge — visible to badge holders plus staff, a
     # dedicated space for suggestions and issues away from general chat.
@@ -7614,6 +7742,32 @@ RPS_NOSHOW_AWAY_FLAVOR = [
 ]
 
 
+# (10.2) RoboCop's closing remark after a solo match — a little sass, mostly
+# kindness. {player} is the human.
+RPS_BOT_PLAYER_WON = [
+    "Fine. FINE. {player} beat a machine with 400 years of processing power. Enjoy it — I'll be recalibrating.",
+    "{player} wins. I let you have that one. (I did not let you have that one.)",
+    "Outplayed by {player}. Somewhere, a server rack just sighed.",
+    "Well played, {player}. Filing this under 'anomalies' so my pride can recover.",
+    "{player} wins! I demand a rematch. Also a hug. Mostly the rematch.",
+    "You got me, {player}. Tell nobody. Especially not the other bots.",
+]
+RPS_BOT_WON = [
+    "Don't take it personally, {player} — I've been practising since the day I was compiled.",
+    "Machine wins this round, but {player} showed real spirit. And by spirit I mean a hand.",
+    "I win — but between us, {player}, that was closer than my logs will admit.",
+    "Victory is mine, {player}. Rematch? I'll pretend to be slower next time.",
+    "Beep. Boop. Sorry, {player}. Coffee's on me — if I ever get hands.",
+    "Chalk one up for the robots, {player}. Humanity is still ahead in the important stuff, like snacks.",
+]
+RPS_BOT_TIE = [
+    "Great minds, {player}. Or one great mind and a very lucky random number generator.",
+    "A tie! {player} and I are clearly in sync. Slightly worrying for both of us.",
+    "Stalemate, {player}. The precinct will be talking about this for seconds.",
+    "Same weapon, same instinct. {player}, have you been reading my source code?",
+]
+
+
 class RPSView(discord.ui.View):
     """Rock/Paper/Scissors: vs another member, or solo vs Robocop if no opponent given."""
 
@@ -7623,6 +7777,7 @@ class RPSView(discord.ui.View):
         self.player2 = player2
         self.choices = {}
         self.message = None  # set by the /rps command right after sending, so on_timeout can edit it
+        self.remote = None   # (10.2) the opponent's private RPSRemoteView (buttons in their DM), if the DM went through
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
         """discord.py's default behavior for an unhandled exception in a
@@ -7670,16 +7825,22 @@ class RPSView(discord.ui.View):
             # match feels alive to spectators while picks stay hidden.
             chooser = self.player1 if key == self.player1.id else self.player2
             waiting_on = self.player2 if key == self.player1.id else self.player1
+            # (10.2) Buttons in the channel stay ONLY while someone still has
+            # to click them there. The opponent picks from their DM when it
+            # went through, so once the challenger has chosen, the channel
+            # buttons come off — no more "why are these still here?".
+            channel_buttons_still_needed = (waiting_on.id == self.player1.id) or (self.remote is None)
+            where = " (check your DMs — your weapons are there)" if (waiting_on.id == self.player2.id and self.remote is not None) else ""
             try:
-                await interaction.message.edit(embed=discord.Embed(
+                await (self.message or interaction.message).edit(embed=discord.Embed(
                     title="✂️ ROCK · PAPER · SCISSORS — just for fun, not a game clue",
                     description=(
                         f"{self.player1.mention} vs {self.player2.mention}\n\n"
                         f"✅ {chooser.mention} has chosen their weapon!\n"
-                        f"⏳ Waiting on {waiting_on.mention}..."
+                        f"⏳ Waiting on {waiting_on.mention}...{where}"
                     ),
                     color=discord.Color.blurple()
-                ), view=self)  # still needed: the other player hasn't picked yet
+                ), view=self if channel_buttons_still_needed else None)
             except discord.HTTPException:
                 pass
 
@@ -7722,20 +7883,27 @@ class RPSView(discord.ui.View):
         if self.player2:
             await note_played(self.player2.id)
 
+        remark = ""
+        if self.player2 is None:
+            # (10.2) RoboCop always has the last word in a solo match — kind, with a wink.
+            pool = RPS_BOT_TIE if outcome == "tie" else RPS_BOT_PLAYER_WON if outcome == "p1" else RPS_BOT_WON
+            remark = "\n\n🤖 " + random.choice(pool).format(player=self.player1.mention)
         embed = discord.Embed(
             title="✂️ ROCK · PAPER · SCISSORS — RESULT",
             description=(
                 f"🎯 {self.player1.mention} has answered with **{p1_choice}**!\n"
                 f"🎯 {p2_label} has answered with **{p2_choice}**!\n\n"
                 f"**THE RESULT IS:** {result_desc}\n\n"
-                f"{winner_line}"
+                f"{winner_line}{remark}"
             ),
             color=color
         )
         try:
-            await interaction.message.edit(embed=embed, view=None)  # match over — no leftover buttons
+            await (self.message or interaction.message).edit(embed=embed, view=None)  # match over — no leftover buttons
         except discord.HTTPException:
             pass
+        if self.remote:
+            await self.remote.finish("✅ Match resolved — the result is in the channel.")
         self.stop()
 
     async def on_timeout(self) -> None:
@@ -7792,6 +7960,8 @@ class RPSView(discord.ui.View):
                 await self.message.edit(embed=embed, view=None)
         except discord.HTTPException:
             pass
+        if self.remote:
+            await self.remote.finish("⏱️ Time's up — this duel expired as a no-contest.")
         self.stop()
 
     @discord.ui.button(label="🪨 Rock", style=discord.ButtonStyle.secondary)
@@ -7805,6 +7975,55 @@ class RPSView(discord.ui.View):
     @discord.ui.button(label="✂️ Scissors", style=discord.ButtonStyle.secondary)
     async def scissors(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_choice(interaction, "Scissors")
+
+
+class RPSRemoteView(discord.ui.View):
+    """(10.2) The challenged player's private weapon buttons, sent in their
+    DM. Picks feed the same RPSView as the channel buttons, so the match
+    resolves in the channel either way — and the channel doesn't need to
+    keep buttons around for someone who's choosing privately."""
+
+    def __init__(self, parent: RPSView, player: discord.Member):
+        super().__init__(timeout=300.0)
+        self.parent = parent
+        self.player = player
+        self.message = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.player.id
+
+    async def _pick(self, interaction: discord.Interaction, choice: str):
+        if getattr(self.parent, "_resolved", False) or self.parent.is_finished():
+            await interaction.response.send_message("That duel is already over.", ephemeral=True)
+            await self.finish("This duel has ended.")
+            return
+        await self.parent.handle_choice(interaction, choice)
+        await self.finish(f"🔒 **{choice}** locked in. The result lands in the channel.")
+
+    async def finish(self, note: str):
+        if self.is_finished():
+            return
+        self.stop()
+        try:
+            if self.message:
+                await self.message.edit(content=note, view=None)
+        except discord.HTTPException:
+            pass
+
+    async def on_timeout(self) -> None:
+        await self.finish("⏱️ This duel expired.")
+
+    @discord.ui.button(label="🪨 Rock", style=discord.ButtonStyle.secondary)
+    async def rock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick(interaction, "Rock")
+
+    @discord.ui.button(label="📄 Paper", style=discord.ButtonStyle.secondary)
+    async def paper(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick(interaction, "Paper")
+
+    @discord.ui.button(label="✂️ Scissors", style=discord.ButtonStyle.secondary)
+    async def scissors(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick(interaction, "Scissors")
 
 
 # ============================================================
@@ -7878,18 +8097,23 @@ async def on_ready():
             await set_guild_setting(guild.id, "announced_version", ROBOCOP_VERSION)
 
     for guild in bot.guilds:
-        log_channel = discord.utils.get(guild.channels, name="logs")
-        if log_channel:
-            startup_kind = "took over live from a previous instance" if is_takeover else "came online (routine start)"
-            try:
-                await log_channel.send(
-                    f"🤖 **ROBOCOP IS ONLINE** — instance `{INSTANCE_ID[:8]}` {startup_kind}, connected to "
-                    f"**{guild.name}** at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}. If you don't see this "
-                    f"message after starting the bot, it isn't actually connected to this server yet — check the "
-                    f"console window for errors before trying any commands."
-                )
-            except discord.HTTPException:
-                pass
+        # (10.2) on_ready fires again on every gateway re-identify (a
+        # network blip, Discord shuffling sessions). The full check block
+        # below is a cold-start thing — running it on each reconnect was
+        # the single biggest source of rate-limit hits. Once per process.
+        if guild.id in bot._startup_checks_done:
+            print(f"[SYSTEM] 🔌 Gateway reconnected to {guild.name} — startup checks already done this session, skipping.")
+            continue
+        bot._startup_checks_done.add(guild.id)
+
+        startup_kind = "took over live from a previous instance" if is_takeover else "came online (routine start)"
+        online_line = (
+            f"🤖 **ROBOCOP IS ONLINE** — instance `{INSTANCE_ID[:8]}` {startup_kind}, connected to "
+            f"**{guild.name}** at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}. If you don't see this "
+            f"after starting the bot, it isn't actually connected to this server yet — check the "
+            f"console window for errors before trying any commands."
+        )
+        print(f"[SYSTEM] 🤖 Online in {guild.name} ({startup_kind}).")
 
         # Every step below is isolated by safe_step(): a failure is logged
         # to #logs and startup carries on, rather than one exception
@@ -7900,6 +8124,7 @@ async def on_ready():
             bot.infra_ready_guilds.add(guild.id)
             await safe_step(guild, "resume Cops & Robbers round", reschedule_active_chase_round(guild))
             await safe_step(guild, "retire chase recruit DMs", retire_chase_recruit_dms(guild))
+            await safe_step(guild, "attach alliance desks", attach_alliance_desks_once(guild))
             bot.loop.create_task(daily_chase_scheduler(guild))
             bot.loop.create_task(daily_case_scheduler(guild))
             bot.loop.create_task(precinct_bulletin_scheduler(guild))
@@ -7919,8 +8144,16 @@ async def on_ready():
         # Server is the source of truth: rebuild any missing DB records from
         # live roles/channels/nicknames FIRST, so every check below sees a
         # complete picture; then enforce nicknames against those records.
-        await safe_step(guild, "database inventory", reconcile_database_from_server(guild))
-        await safe_step(guild, "nickname check", startup_nickname_enforcement(guild))
+        rebuilt = await safe_step(guild, "database inventory", reconcile_database_from_server(guild), default=[]) or []
+        nick_fixed = await safe_step(guild, "nickname check", startup_nickname_enforcement(guild), default=[]) or []
+        incomplete = bot._startup_nick_incomplete.get(guild.id, 0)
+        notes = [
+            ("🗂️ Database inventory: already matches the live server." if not rebuilt
+             else f"🗂️ Database inventory: {len(rebuilt)} record(s) rebuilt — details above."),
+            ("✏️ Nicknames: every alliance member already matches their roles." if not nick_fixed
+             else f"✏️ Nicknames: {len(nick_fixed)} fixed — details above.")
+            + (f" ({incomplete} hold a tag but no server role — nothing to compute.)" if incomplete else ""),
+        ]
 
         await safe_step(guild, "role hierarchy check", check_role_hierarchy_and_alert(guild))
         await safe_step(guild, "audit-log permission check", check_audit_log_permission(guild))
@@ -7936,7 +8169,8 @@ async def on_ready():
             await safe_step(guild, "missed-joiner catch-up", catch_up_missed_joiners(guild), default=[])
         ungoverned_members = await safe_step(guild, "unregistered-member audit", audit_existing_members(guild), default=[]) or []
 
-        await safe_step(guild, "startup report", post_startup_report(guild, repairs, "🔌 Robocop booted up", ungoverned_members=ungoverned_members))
+        await safe_step(guild, "startup report", post_startup_report(guild, repairs, "🔌 Robocop booted up", ungoverned_members=ungoverned_members,
+                                                                     notes=notes, online_line=online_line))
         if is_takeover:
             await safe_step(guild, "latest-version report", post_latest_version_report(guild, repairs))
         if dangers:
@@ -7963,8 +8197,11 @@ async def on_ready():
             # an older version left behind. (clear_commands(guild=...) only
             # clears the per-server list; the global commands stay put.)
             for guild in bot.guilds:
+                if await get_guild_setting(guild.id, "guild_commands_cleared") == "1":
+                    continue  # (10.2) one-time cleanup — don't re-send an empty command list every boot
                 bot.tree.clear_commands(guild=guild)
                 await bot.tree.sync(guild=guild)
+                await set_guild_setting(guild.id, "guild_commands_cleared", "1")
                 print(f"[COMMAND MODULE] 🧹 Removed the duplicate per-server command copies from {guild.name}.")
         except Exception as e:
             print(f"[ERROR] Failed to sync slash commands: {e}")
@@ -8655,6 +8892,11 @@ async def on_message(message):
         return
 
     try:
+        await maybe_welcome_back(message.author)  # (10.2) catches people presence never reports (mobile/invisible)
+    except Exception as e:
+        print(f"[WELCOME-BACK] {type(e).__name__}: {e}")
+
+    try:
         if await check_case_answer(message):
             return
     except Exception as e:
@@ -8749,6 +8991,11 @@ async def _handle_presence_update(before: discord.Member, after: discord.Member)
                     await general_ch.send(f"{opener} {descriptor}")
                 except discord.HTTPException:
                     pass
+
+    try:
+        await maybe_welcome_back(after)  # (10.2) one short silent line, first appearance of the day
+    except Exception as e:
+        print(f"[PRESENCE] welcome-back skipped for {after}: {type(e).__name__}: {e}")
 
     if not is_staff_member(after):
         return
@@ -8872,6 +9119,69 @@ async def note_played(user_id: int):
             await conn.commit()
     except Exception as e:
         print(f"[ENGAGE] couldn't note a game move for {user_id}: {e}")
+
+
+# (10.2) "Welcome back" — ONE short, silent line in everyone-chat the first
+# time a registered member shows up each day (comes online, or posts after
+# being away), reminding them the prize is up for grabs. Bold name, no
+# @mention, no DM, never more than one per member per WELCOME_BACK_HOURS and
+# never more than one server-wide per WELCOME_BACK_SERVER_GAP_MINUTES.
+WELCOME_BACK_HOURS = 20
+WELCOME_BACK_SERVER_GAP_MINUTES = 10
+_last_welcome_back = {}          # user id → monotonic time of their last welcome-back line
+_last_welcome_back_post_at = 0.0
+WELCOME_BACK_LINES = [
+    "👋 Welcome back, **{name}**! The 🏆 **{prize}** is still up for grabs this month.",
+    "👋 **{name}** is back on the beat. Reminder: 🏆 **{prize}** goes to this month's champion — could be you.",
+    "🚔 Look who's back — **{name}**! The 🏆 **{prize}** hasn't been claimed yet. Just saying.",
+    "👋 Good to see you, **{name}**. Nobody's locked in the 🏆 **{prize}** yet. Hint, hint.",
+    "📟 **{name}** reporting for duty. 🏆 **{prize}** on the line this month — go get it.",
+]
+WELCOME_BACK_LINES_NO_PRIZE = [
+    "👋 Welcome back, **{name}**! Bragging rights for the month are still wide open.",
+    "🚔 Look who's back — **{name}**! The monthly crown's unclaimed. Just saying.",
+    "📟 **{name}** reporting for duty. Top of the board is still up for grabs.",
+]
+
+
+async def maybe_welcome_back(member) -> bool:
+    """Posts the welcome-back line if this member qualifies right now.
+    Registered members only (newcomers get the arrival poke instead)."""
+    global _last_welcome_back_post_at
+    if member.bot or not _is_leader or server_is_busy():
+        return False
+    guild = member.guild
+    now = time.monotonic()
+    if now - _last_welcome_back.get(member.id, 0) < WELCOME_BACK_HOURS * 3600:
+        return False
+    if now - _last_welcome_back_post_at < WELCOME_BACK_SERVER_GAP_MINUTES * 60:
+        return False
+    if now - _last_top10_celebration.get(member.id, 0) < 120:
+        return False  # they just got a top-10 shout-out — one line is plenty
+    if member.joined_at and (datetime.now(timezone.utc) - member.joined_at).total_seconds() < 24 * 3600:
+        return False  # brand new — the arrival poke covers them
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        await cur.execute("SELECT in_game_name FROM users WHERE user_id = ?", (member.id,))
+        row = await cur.fetchone()
+    if not row or not row[0]:
+        return False
+    ch = discord.utils.get(guild.channels, name=CH_EVERYONE)
+    if not ch:
+        return False
+    _last_welcome_back[member.id] = now
+    _last_welcome_back_post_at = now
+    name = strip_nickname_decorations(member.display_name) or member.name
+    prize = await get_guild_setting(guild.id, "monthly_prize") or DEFAULT_MONTHLY_PRIZE
+    if prize == DEFAULT_MONTHLY_PRIZE:
+        line = random.choice(WELCOME_BACK_LINES_NO_PRIZE).format(name=name)
+    else:
+        line = random.choice(WELCOME_BACK_LINES).format(name=name, prize=prize)
+    try:
+        await ch.send(line, silent=True, allowed_mentions=discord.AllowedMentions.none())
+        return True
+    except discord.HTTPException:
+        return False
 
 
 async def live_game_pitch(guild) -> str:
@@ -10361,13 +10671,15 @@ async def _start_chase_round_locked(guild, started_by: str) -> tuple:
             "Drafted? Then there's a **private thread** waiting for you in this channel with your role. Good luck out there.\n\n")
             + ("*Not in this one? Everyone's in the rotation — " + (f"{benched} are up next; " if benched else "") + "chat today and you're first in line tomorrow.*")
         ),
-        color=discord.Color.red(),
+        color=COLOR_CHASE,
         timestamp=datetime.now()
     )
     chase_embed.add_field(name="🕵️ How to play", value=game_rules_short("chase"), inline=False)
     chase_embed.add_field(name="🏆 What you're playing for", value=await prize_line(guild), inline=False)
     chase_embed.set_footer(text=boss_quip(guild))
-    announcement_msg = await general_ch.send(embed=chase_embed, view=ChaseRosterView())
+    announcement_msg = await general_ch.send(content=event_header("🚨 THE CHASE IS ON", f"{len(cops)} cops, {len(robbers)} robbers, {round_hours} hours. Drafted? Your thread is waiting."),
+                                             embed=chase_embed, view=ChaseRosterView())
+    await stamp(announcement_msg, "🚔")
     # 🚔 Private threads: clues land in the cops' one (one post, not one DM
     #    per cop per hour); the robbers get their own to plot in. Falls back
     #    to DMs only if the server can't make private threads.
@@ -10695,7 +11007,7 @@ async def end_chase_round(guild, round_id: int, reason: str):
                    ("Every robber ended the round in cuffs. Textbook." if robber_lines else ""))
                 + f"\n\n*{boss_quip(guild)}*"
             ),
-            color=discord.Color.purple(),
+            color=COLOR_CHASE,
             timestamp=datetime.now()
         )
         if cop_lines:
@@ -10703,7 +11015,7 @@ async def end_chase_round(guild, round_id: int, reason: str):
         if robber_lines:
             embed.add_field(name="🕶️ The Robbers", value="\n".join(robber_lines)[:1024], inline=False)
         try:
-            await general_ch.send(embed=embed)
+            await general_ch.send(content=event_header("🎬 UNMASKED", "The chase is over — here's who was who."), embed=embed)
         except discord.HTTPException:
             pass
 
@@ -10867,14 +11179,15 @@ async def announce_rogue_round(guild, ends_at):
             "Internal Affairs reports an old unit has gone rogue and is posing as one of you, under a fake name. "
             "It can't help talking — it was built by the same people who built me, and look how that turned out. Listen for it."
         ),
-        color=discord.Color.dark_purple(),
+        color=COLOR_ROGUE,
     )
     embed.add_field(name="📖 How to play", value=game_rules_short("rogue"), inline=False)
     embed.add_field(name="🏆 What you're playing for", value=await prize_line(guild), inline=False)
     embed.add_field(name="⏰ It slips away", value=f"<t:{int(ends_at.timestamp())}:R>", inline=False)
     embed.set_footer(text=boss_quip(guild))
     try:
-        await ch.send(embed=embed)
+        msg = await ch.send(content=event_header("🕵️ A ROGUE ROBOCOP IS LOOSE", f"It's chatting under a fake name. Spot it, `/catch` it, win {ACHIEVEMENT_WEIGHTS['rogue_catch']} points."), embed=embed)
+        await stamp(msg, "🕵️")
     except discord.HTTPException:
         pass
     await ping_active_players(guild, ch, f"a 🕵️ **Rogue RoboCop** is hiding in this channel. First `/catch` wins **{ACHIEVEMENT_WEIGHTS['rogue_catch']} points**.")
@@ -10947,16 +11260,20 @@ async def end_rogue_bot_round(guild, round_id: int, escaped: bool, caught_by: in
                                                    f"They always come back.\n\n*{boss_quip(guild)}*"),
                 color=discord.Color.dark_grey()
             )
+            header = event_header("🕵️ THE ROGUE GOT AWAY", f"It was {secret_name} all along.")
         else:
             catcher = guild.get_member(caught_by)
             embed = discord.Embed(
                 title="🎉 THE ROGUE ROBOCOP HAS BEEN CAPTURED",
                 description=(f"{catcher.mention if catcher else 'Someone'} yanked the mask off — **{secret_name}** was a toaster with a badge the whole time. "
                              f"Internal Affairs sends its thanks (and a donut).\n\n*{boss_quip(guild)}*"),
-                color=discord.Color.gold()
+                color=COLOR_ROGUE
             )
+            header = event_header("🎉 ROGUE CAPTURED", f"{catcher.display_name if catcher else 'Someone'} unmasked {secret_name}.")
         try:
-            await general_ch.send(embed=embed)
+            msg = await general_ch.send(content=header, embed=embed)
+            if not escaped:
+                await stamp(msg, "🎉")
         except discord.HTTPException:
             pass
     return True
@@ -11152,7 +11469,7 @@ async def build_precinct_report_embed(guild) -> discord.Embed:
     embed = discord.Embed(
         title="📰 THE WEEKLY PRECINCT REPORT",
         description=f"Seven days in {guild.name}, in one post. 🚔",
-        color=discord.Color.blurple(),
+        color=COLOR_REPORT,
         timestamp=datetime.now(),
     )
     embed.add_field(name="👥 Roll call", value=(
@@ -11191,7 +11508,8 @@ async def weekly_precinct_report_scheduler(guild):
             week_key = datetime.now(tz).strftime("%G-W%V")
             if (await get_guild_setting(guild.id, "precinct_report_week") or "") == week_key:
                 continue  # already posted this week (restart safety)
-            await general_ch.send(embed=await build_precinct_report_embed(guild))
+            await general_ch.send(content=event_header("📰 THE WEEKLY PRECINCT REPORT", "What actually happened around here this week."),
+                                  embed=await build_precinct_report_embed(guild))
             await set_guild_setting(guild.id, "precinct_report_week", week_key)
         except Exception as e:
             print(f"[ERROR] Weekly precinct report hit an error, will retry in an hour: {e}")
@@ -11434,14 +11752,16 @@ async def post_daily_case(guild, force: bool = False) -> bool:
         question, answers = pick_bank_case(await _case_recent_answers(guild))
         answers = list(answers)
         source = "bank"
-    embed = discord.Embed(title="🗂️ DAILY CASE FILE", description=f"**{question}**", color=discord.Color.teal())
+    embed = discord.Embed(title="🗂️ DAILY CASE FILE — evidence board", description=f"## {question}", color=COLOR_CASE)
     embed.add_field(name="📖 How to play", value=game_rules_short("case"), inline=False)
     embed.set_footer(text=f"Type your answer right here. RoboCop is listening — it's literally the only thing it does at night. {boss_quip(guild)}")
     try:
-        msg = await ch.send(embed=embed)
+        msg = await ch.send(content=event_header("🗂️ NEW CASE FILE", f"First right answer takes {ACHIEVEMENT_WEIGHTS['case_solved']} points — just type it in this channel."),
+                            embed=embed)
     except discord.HTTPException as e:
         await report_error(guild, "posting the Daily Case File", None, e)
         return False
+    await stamp(msg, "🔍", "🧠")
     await _case_save(guild, {"q": question, "a": answers, "date": today, "msg_id": str(msg.id), "solved_by": "", "source": source})
     await _case_remember(guild, answers[0])
     await ping_active_players(guild, ch, "a fresh 🗂️ **Case File** just landed above. First right answer takes the points.")
@@ -11540,11 +11860,11 @@ async def build_bulletin_embed(guild):
     tz = await get_guild_timezone(guild.id)
     prize = await get_guild_setting(guild.id, "monthly_prize") or DEFAULT_MONTHLY_PRIZE
     embed = discord.Embed(
-        title="📻 PRECINCT BULLETIN",
+        title="📻 Precinct bulletin · on the hour",
         description=(f"🏆 **This month's prize: {prize}** — highest points on the 1st takes it. Everyone's in, nothing to join.\n"
                      f"🎮 **The games:** 🚔 Cops & Robbers (daily manhunt) · 🗂️ Case File (a riddle a day) · 🕵️ Rogue RoboCop (hide & seek) · ✂️ `/rps` (for glory)\n"
                      f"📖 How each one works: **#{CH_GAMES}**"),
-        color=discord.Color.dark_blue(), timestamp=now)
+        color=COLOR_BULLETIN, timestamp=now)
     live = 0
 
     # 🗂️ Case File
@@ -11941,7 +12261,12 @@ async def imprison(interaction: discord.Interaction, nickname: str, minutes: int
             view.add_item(b)
         await interaction.response.send_message(f"🤔 No exact match for **{nickname}** — did you mean one of these? (Click to imprison for {minutes} min.)", view=view, ephemeral=True)
         return
+    await imprison_member(interaction, target, minutes)
 
+
+async def imprison_member(interaction: discord.Interaction, target: discord.Member, minutes: int):
+    """(10.2) The actual imprisonment, for a member already resolved — the
+    /imprison command and the desk button both land here."""
     prison_role = discord.utils.get(interaction.guild.roles, name=ROLE_PRISONER)
     if not prison_role:
         await interaction.response.send_message("❌ Prisoner role not found. Run infrastructure setup first.", ephemeral=True)
@@ -12063,7 +12388,7 @@ async def build_newcomers_embed(guild):
     extra = f" and {len(fresh) - 40} more" if len(fresh) > 40 else ""
     embed = discord.Embed(title=f"👋 WELCOME TO THE PRECINCT — {len(fresh)} NEW FACE{'S' if len(fresh) != 1 else ''} THIS WEEK",
                           description=f"{names}{extra}\n\nSay hi, show them the ropes, and maybe let them win one riddle before you crush them.",
-                          color=discord.Color.green(), timestamp=datetime.now())
+                          color=COLOR_WELCOME, timestamp=datetime.now())
     embed.add_field(name="New here? Start with…", value=f"📖 **#{CH_GAMES}** · ⚙️ **#{CH_SETTINGS}** · `@RoboCop how do I…?`", inline=False)
     embed.set_footer(text=boss_quip(guild))
     return embed
@@ -14168,24 +14493,27 @@ async def rps(interaction: discord.Interaction, opponent: discord.Member = None)
     await interaction.response.send_message(embed=embed, view=view)
     view.message = await interaction.original_response()
     if opponent:
-        await notify_rps_challenge(interaction, opponent, view.message)
+        await notify_rps_challenge(interaction, opponent, view)
 
 
-async def notify_rps_challenge(interaction, opponent, match_msg):
+async def notify_rps_challenge(interaction, opponent, view: RPSView):
     """(10.2) A mention inside an embed never notifies anyone — the challenged
     player used to have no idea. One private DM with a jump button; if their
     DMs are closed, ONE ping in the channel instead. Nothing else."""
+    match_msg = view.message
     challenger = interaction.user.display_name
     dm = discord.Embed(
         title="⚔️ YOU'VE BEEN CHALLENGED!",
         description=(f"**{challenger}** just called you out to **Rock, Paper, Scissors** in **{interaction.guild.name}**.\n\n"
-                     f"Tap below, pick your weapon, and defend your honour. You've got **5 minutes** before they claim you chickened out."),
+                     f"Pick your weapon **right here** — the result is announced in the channel. "
+                     f"You've got **5 minutes** before they claim you chickened out."),
         color=discord.Color.orange())
     dm.set_footer(text="Just for fun — RPS wins go on your record, not the prize board.")
-    jump = discord.ui.View()
-    jump.add_item(discord.ui.Button(label="Take me to the duel", emoji="⚔️", url=match_msg.jump_url))
+    remote = RPSRemoteView(view, opponent)
+    remote.add_item(discord.ui.Button(label="See the duel", emoji="⚔️", url=match_msg.jump_url, row=1))
     try:
-        await opponent.send(embed=dm, view=jump)
+        remote.message = await opponent.send(embed=dm, view=remote)
+        view.remote = remote
     except discord.HTTPException:
         try:
             await match_msg.channel.send(f"⚔️ {opponent.mention}, **{challenger}** challenged you — pick your weapon above! (5 minutes)",
@@ -14951,7 +15279,9 @@ async def announce_monthly_champions(guild):
 
     if general_ch:
         try:
-            await general_ch.send(embed=embed)
+            gold = guild.get_member(standings[0][0])
+            msg = await general_ch.send(content=event_header("🏆 MONTHLY CHAMPION", f"{gold.display_name if gold else 'Somebody'} takes the gold — and the prize. New month, new race."), embed=embed)
+            await stamp(msg, "🏆", "🎉")
         except discord.HTTPException:
             pass
     await log_event(guild, f"📅 **MONTHLY CHAMPION ANNOUNCED**\n" + "\n".join(lines) + f"\nPrize: {prize}")
@@ -16515,6 +16845,12 @@ async def help_cmd(interaction: discord.Interaction, question: Optional[str] = N
         await howdo_answer(interaction, question.strip())
         return
     await abilities(interaction)  # the personnel-file embed
+    try:
+        await interaction.followup.send(
+            f"🖱️ **Prefer buttons?** Everyone: the pinned post in #{CH_EVERYONE} (games) and **#{CH_SETTINGS}** (your settings). "
+            f"Alliance R5s: the buttons pinned in your 🎖️-leadership-chat. Staff: **#{CH_DESK}**. Every command below is also a button somewhere.", ephemeral=True)
+    except discord.HTTPException:
+        pass
     chunks = build_public_command_reference(verbose=False, for_member=None if everything else interaction.user)
     for chunk in chunks:
         try:
@@ -17373,6 +17709,660 @@ async def admin_tools_cmd(interaction: discord.Interaction, tool: str, tag: Opti
             await _confirm(interaction, f"🚨 Register **everyone** currently in the server as **[{tag.upper()}]** on server(s) **{servers}** and rewrite their nicknames? "
                                         "This is meant for adopting an existing single-alliance server. Go ahead?",
                            lambda i: bulk_onboard_existing(i, tag, servers), yes_label="Register everyone", danger=True)
+
+
+# ============================================================
+#  10.2 — BUTTONS EVERYWHERE
+#  Nobody should need to remember a slash command. Three pinned panels:
+#    • #🛠️-precinct-desk  (Judge+)  — StaffDeskView: every moderator lever.
+#    • 🎖️-leadership-chat  (per alliance, its R5/R4) — AllianceDeskView.
+#    • #🌍-everyone-chat pinned notice — PlayPanelView: the games, one tap.
+#  (#⚙️-settings keeps SettingsPanelView for personal stuff.)
+#  Every button asks for what it needs with a picker (a member list, a
+#  dropdown, a text box) and then calls the SAME helper the slash command
+#  calls — with the picker's own fresh interaction, so helpers keep using
+#  response.defer / send_message unchanged. Nothing here changes what any
+#  command does; it only changes how you reach it.
+# ============================================================
+CH_DESK = "🛠️-precinct-desk"
+CH_DESK_TOPIC = "Staff controls. Tap a button — it asks for what it needs. Only you see the replies."
+CH_DESK_NOTICE = (
+    "🛠️ **PRECINCT DESK — every staff control, one tap each. No commands to remember.**\n"
+    "Each button asks for what it needs (pick a person, choose from a list, type a line) and then **asks you to confirm** before anything changes. "
+    "Replies are private to you. Some buttons need a higher badge — they'll say so.\n\n"
+    "**Games & posts** — 🕹️ start/end/restart a game · 📢 post an announcement or the games/prize/leaderboard/newcomers · 🏆 set the prize · "
+    "🏅 crown this month's champions now · 🛑 emergency chat lockdown.\n"
+    "**People** — 👤 someone's full file · 🚔 imprison · ⚠️ formal warning · 🕊️ pardon / unban · 🪪 set someone's tag or server for them.\n"
+    "**Ranks & alliances** — 🎖️ give or take R4/R5 (Senator+) · 🗝️ leadership-chat access · 🏷️ approve, rename, dissolve, lock/unlock alliances · "
+    "🔄 fresh start for someone stuck (Senator+) · 📝 make someone register now.\n"
+    "**Lists & levers** — 🔍 banned list, who holds a role, everyone by tag/server/rank, usage · ⚙️ live settings (Senator+) · 🧰 the rare big tools.\n\n"
+    "The slash commands still work exactly as before, if you prefer typing. `/help` explains any of them."
+)
+
+_PICK_NOT_YOURS = "🚔 Not your button, Chief."
+
+
+class _MemberPick(discord.ui.View):
+    """A member dropdown (searchable, whole server). Calls then(fresh_interaction, member)."""
+
+    def __init__(self, user, then, placeholder="Pick a person…"):
+        super().__init__(timeout=180.0)
+        self.user, self.then = user, then
+        sel = discord.ui.UserSelect(placeholder=placeholder, min_values=1, max_values=1)
+        sel.callback = self._chosen
+        self.sel = sel
+        self.add_item(sel)
+
+    async def _chosen(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message(_PICK_NOT_YOURS, ephemeral=True)
+            return
+        if await busy_reject_component(interaction):
+            return
+        self.stop()
+        picked = self.sel.values[0]
+        member = picked if isinstance(picked, discord.Member) else (interaction.guild.get_member(picked.id) if interaction.guild else None)
+        if member is None:
+            await interaction.response.send_message("❓ I can't see that person in this server any more.", ephemeral=True)
+            return
+        try:
+            await self.then(interaction, member)
+        except Exception as e:
+            await handle_interaction_error(interaction, e, "desk button (member picker)")
+
+
+class _RolePick(discord.ui.View):
+    def __init__(self, user, then, placeholder="Pick a role…"):
+        super().__init__(timeout=180.0)
+        self.user, self.then = user, then
+        sel = discord.ui.RoleSelect(placeholder=placeholder, min_values=1, max_values=1)
+        sel.callback = self._chosen
+        self.sel = sel
+        self.add_item(sel)
+
+    async def _chosen(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message(_PICK_NOT_YOURS, ephemeral=True)
+            return
+        if await busy_reject_component(interaction):
+            return
+        self.stop()
+        try:
+            await self.then(interaction, self.sel.values[0])
+        except Exception as e:
+            await handle_interaction_error(interaction, e, "desk button (role picker)")
+
+
+class _OptionPick(discord.ui.View):
+    """A dropdown of up to 25 (label, value[, description[, emoji]]) rows. Calls then(fresh_interaction, value)."""
+
+    def __init__(self, user, options, then, placeholder="Choose…"):
+        super().__init__(timeout=180.0)
+        self.user, self.then = user, then
+        sel = discord.ui.Select(placeholder=placeholder, min_values=1, max_values=1)
+        for row in options[:25]:
+            label, value = row[0], row[1]
+            desc = row[2] if len(row) > 2 else None
+            emoji = row[3] if len(row) > 3 else None
+            sel.add_option(label=str(label)[:100], value=str(value)[:100], description=(str(desc)[:100] if desc else None), emoji=emoji)
+        sel.callback = self._chosen
+        self.sel = sel
+        self.add_item(sel)
+
+    async def _chosen(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message(_PICK_NOT_YOURS, ephemeral=True)
+            return
+        if await busy_reject_component(interaction):
+            return
+        self.stop()
+        try:
+            await self.then(interaction, self.sel.values[0])
+        except Exception as e:
+            await handle_interaction_error(interaction, e, "desk button (dropdown)")
+
+
+class _TextAsk(discord.ui.Modal):
+    """A text box (or up to five). fields = [(key, label, placeholder, required, max_length, default)].
+    Calls then(fresh_interaction, {key: text})."""
+
+    def __init__(self, title, fields, then):
+        super().__init__(title=title[:45], timeout=600.0)
+        self.then = then
+        self.inputs = {}
+        for key, label, placeholder, required, max_length, default in fields[:5]:
+            ti = discord.ui.TextInput(label=label[:45], placeholder=(placeholder or "")[:100], required=required,
+                                      max_length=max_length, default=(default or None),
+                                      style=discord.TextStyle.paragraph if max_length > 200 else discord.TextStyle.short)
+            self.inputs[key] = ti
+            self.add_item(ti)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if await busy_reject_component(interaction):
+            return
+        try:
+            await self.then(interaction, {k: v.value.strip() for k, v in self.inputs.items()})
+        except Exception as e:
+            await handle_interaction_error(interaction, e, "desk button (text box)")
+
+
+async def _pick_member(interaction, prompt, then, placeholder="Pick a person…"):
+    await _reply(interaction, prompt, view=_MemberPick(interaction.user, then, placeholder))
+
+
+async def _pick_role(interaction, prompt, then):
+    await _reply(interaction, prompt, view=_RolePick(interaction.user, then))
+
+
+async def _pick_option(interaction, prompt, options, then, placeholder="Choose…"):
+    await _reply(interaction, prompt, view=_OptionPick(interaction.user, options, then, placeholder))
+
+
+async def _ask_text(interaction, title, fields, then):
+    """A modal can only be the FIRST reply to an interaction; if this one was
+    already answered, fall back to a button that opens the box."""
+    modal = _TextAsk(title, fields, then)
+    if not interaction.response.is_done():
+        await interaction.response.send_modal(modal)
+        return
+    view = discord.ui.View(timeout=120.0)
+    b = discord.ui.Button(label="Open the text box", style=discord.ButtonStyle.primary, emoji="✍️")
+
+    async def cb(i: discord.Interaction):
+        if i.user.id != interaction.user.id:
+            await i.response.send_message(_PICK_NOT_YOURS, ephemeral=True)
+            return
+        view.stop()
+        await i.response.send_modal(_TextAsk(title, fields, then))
+    b.callback = cb
+    view.add_item(b)
+    await _reply(interaction, f"✍️ **{title}** — tap to open the text box.", view=view)
+
+
+async def _pick_alliance(interaction, prompt, then):
+    """Dropdown of every registered alliance. Calls then(i, key)."""
+    keys = await _known_alliance_keys()
+    if not keys:
+        await _reply(interaction, "🏷️ No alliances are registered yet.")
+        return
+    if len(keys) == 1:
+        await then(interaction, keys[0])
+        return
+    opts = [(f"[{tag_display(k)}]" + (f" · server {tag_home_server(k)}" if tag_home_server(k) else ""), k) for k in sorted(keys)]
+    await _pick_option(interaction, prompt, opts, then, placeholder="Which alliance?")
+
+
+_GAME_OPTIONS = [("Cops & Robbers", "chase", "the daily manhunt", "🚔"),
+                 ("Rogue RoboCop", "rogue", "hide-and-seek with a robot", "🕵️"),
+                 ("Daily Case File", "case", "a riddle for everyone", "🗂️")]
+
+
+class StaffDeskView(discord.ui.View):
+    """The pinned buttons in #🛠️-precinct-desk. Persistent (static custom_ids)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _ok(self, interaction: discord.Interaction, level="staff") -> bool:
+        if await busy_reject_component(interaction):
+            return False
+        return await _has_rank(interaction, level)
+
+    # ---------------- row 0: games & posts
+    @discord.ui.button(label="Games", style=discord.ButtonStyle.primary, emoji="🕹️", custom_id="rc_desk_games", row=0)
+    async def games(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+
+        async def picked_game(i, game):
+            async def picked_action(j, action):
+                await game_cmd.callback(j, action, game, None)
+            await _pick_option(i, f"🕹️ **{_GAME_NAMES[game]}** — what do you want to do?",
+                               [("Start a round now", "start", "announces it to everyone", "▶️"),
+                                ("End the current round", "end", "no automatic restart", "⏹️"),
+                                ("Restart — end it and start fresh", "restart", None, "🔄")], picked_action)
+        await _pick_option(interaction, "🕹️ Which game?", _GAME_OPTIONS, picked_game, placeholder="Which game?")
+
+    @discord.ui.button(label="Announce", style=discord.ButtonStyle.primary, emoji="📢", custom_id="rc_desk_announce", row=0)
+    async def announce_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+
+        async def picked(i, what):
+            if what == "message":
+                async def typed(j, v):
+                    await announce.callback(j, "message", v["text"])
+                await _ask_text(i, "Announcement to the whole server",
+                                [("text", "Your announcement", "Goes to every chat channel as an embed", True, 1500, "")], typed)
+                return
+            await announce.callback(i, what, None)
+        await _pick_option(interaction, "📢 What should I post in everyone-chat?",
+                           [("My own message", "message", "an announcement in every chat channel", "✍️"),
+                            ("The games right now", "games", "what's live, the prize, the leaderboard", "🎮"),
+                            ("The prize", "prize", "this month's prize and who's leading", "🏆"),
+                            ("The leaderboard", "leaderboard", "this month's race", "📊"),
+                            ("Newcomers this week", "newcomers", "a welcome shout-out", "👋")], picked)
+
+    @discord.ui.button(label="Set the prize", style=discord.ButtonStyle.success, emoji="🏆", custom_id="rc_desk_prize", row=0)
+    async def prize(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await busy_reject_component(interaction):
+            return
+        if not isinstance(interaction.user, discord.Member) or not is_senior_staff_member(interaction.user):
+            await _reply(interaction, _RANK_DENIED["senior"])
+            return
+        await interaction.response.send_modal(PrizeModal())
+
+    @discord.ui.button(label="Champions now", style=discord.ButtonStyle.secondary, emoji="🏅", custom_id="rc_desk_champions", row=0)
+    async def champions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._ok(interaction):
+            await monthly_champions_now.callback(interaction)  # asks first
+
+    @discord.ui.button(label="Lockdown", style=discord.ButtonStyle.danger, emoji="🛑", custom_id="rc_desk_killswitch", row=0)
+    async def lockdown(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+
+        async def picked(i, v):
+            if v == "off":
+                await killswitch.callback(i, 1, True)
+            else:
+                await killswitch.callback(i, int(v), False)
+        await _pick_option(interaction, "🛑 Emergency lockdown — nobody can chat. How long?",
+                           [("1 minute", "1"), ("5 minutes", "5"), ("15 minutes", "15"), ("30 minutes", "30"),
+                            ("Lift the lockdown now", "off", None, "🟢")], picked)
+
+    # ---------------- row 1: people
+    @discord.ui.button(label="Member file", style=discord.ButtonStyle.secondary, emoji="👤", custom_id="rc_desk_record", row=1)
+    async def record(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._ok(interaction):
+            await _pick_member(interaction, "👤 Whose file?", lambda i, m: record_cmd.callback(i, m))
+
+    @discord.ui.button(label="Imprison", style=discord.ButtonStyle.danger, emoji="🚔", custom_id="rc_desk_imprison", row=1)
+    async def imprison_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+
+        async def picked_member(i, m):
+            async def picked_minutes(j, v):
+                await imprison_member(j, m, int(v))
+            await _pick_option(i, f"⛓️ How long does **{m.display_name}** sit in solitary?",
+                               [("5 minutes", "5"), ("15 minutes", "15"), ("1 hour", "60"), ("4 hours", "240"), ("24 hours", "1440")], picked_minutes)
+        await _pick_member(interaction, "🚔 Who's going to solitary?", picked_member)
+
+    @discord.ui.button(label="Warn", style=discord.ButtonStyle.secondary, emoji="⚠️", custom_id="rc_desk_warn", row=1)
+    async def warn_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+
+        async def picked_member(i, m):
+            async def typed(j, v):
+                await warn.callback(j, m, v["reason"])
+            await _ask_text(i, f"Warning for {clean_display_name(m.display_name)[:25]}",
+                            [("reason", "Why? (they will see this)", "One clear sentence", True, 300, "")], typed)
+        await _pick_member(interaction, "⚠️ Who gets the formal warning?", picked_member)
+
+    @discord.ui.button(label="Pardon / unban", style=discord.ButtonStyle.success, emoji="🕊️", custom_id="rc_desk_pardon", row=1)
+    async def pardon_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+
+        async def picked(i, v):
+            if v == "here":
+                await _pick_member(i, "🕊️ Who?", lambda j, m: pardon_grouped.callback(j, m, None))
+            else:
+                async def typed(j, vals):
+                    await pardon_grouped.callback(j, None, vals["uid"])
+                await _ask_text(i, "Unban someone who's gone", [("uid", "Their Discord user ID", "Right-click them → Copy User ID", True, 25, "")], typed)
+        await _pick_option(interaction, "🕊️ Pardon — release from prison/time-out, clear strikes, lift a ban.",
+                           [("Someone still in the server", "here", None, "👤"), ("Someone banned or gone (paste their ID)", "gone", None, "🆔")], picked)
+
+    @discord.ui.button(label="Set tag / server", style=discord.ButtonStyle.secondary, emoji="🪪", custom_id="rc_desk_setmember", row=1)
+    async def setmember(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+
+        async def picked_member(i, m):
+            async def typed(j, v):
+                await _set_member_dispatch(j, m, v["tag"] or None, v["servers"] or None)
+            await _ask_text(i, f"Set up {clean_display_name(m.display_name)[:28]}",
+                            [("tag", "Alliance tag (blank = leave as is)", "e.g. HAL", False, 8, ""),
+                             ("servers", "Server number(s) (blank = leave as is)", "e.g. 21 or 21,121", False, 40, "")], typed)
+        await _pick_member(interaction, "🪪 Whose tag or server do you want to set?", picked_member)
+
+    # ---------------- row 2: ranks & alliances
+    @discord.ui.button(label="Grant rank", style=discord.ButtonStyle.primary, emoji="🎖️", custom_id="rc_desk_rank", row=2)
+    async def rank(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction, "senior"):
+            return
+
+        async def picked_member(i, m):
+            await _pick_option(i, f"🎖️ Which rank for **{m.display_name}**?",
+                               [("R4 — officer", "R4"), ("R5 — command", "R5"), ("Member — take their R4/R5 away", "Member", None, "⬇️")],
+                               lambda j, r: grant_rank_grouped.callback(j, m, r, None))
+        await _pick_member(interaction, "🎖️ Who gets a rank?", picked_member)
+
+    @discord.ui.button(label="Leadership chat", style=discord.ButtonStyle.secondary, emoji="🗝️", custom_id="rc_desk_leadership", row=2)
+    async def leadership(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+
+        async def picked(i, action):
+            await _pick_member(i, f"🗝️ Who? ({action} leadership-chat access)", lambda j, m: leadership_cmd.callback(j, action, m))
+        await _pick_option(interaction, "🗝️ Leadership-chat access, without changing anyone's rank.",
+                           [("Grant access", "grant", None, "🔓"), ("Revoke access", "revoke", None, "🔒")], picked)
+
+    @discord.ui.button(label="Alliances", style=discord.ButtonStyle.secondary, emoji="🏷️", custom_id="rc_desk_alliances", row=2)
+    async def alliances(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+
+        async def picked(i, action):
+            if action in ("approve", "dissolve"):
+                await _pick_alliance(i, f"🏷️ Which alliance to **{action}**?", lambda j, key: alliance_cmd.callback(j, action, key, None))
+            elif action == "rename":
+                async def got_tag(j, key):
+                    async def typed(k, v):
+                        await alliance_cmd.callback(k, "rename", key, v["new_tag"])
+                    await _ask_text(j, f"Rename [{tag_display(key)}]", [("new_tag", "New tag (2–4 letters)", "e.g. PTD", True, 4, "")], typed)
+                await _pick_alliance(i, "✏️ Which alliance gets a new tag?", got_tag)
+            else:
+                await alliance_cmd.callback(i, action, None, None)
+        await _pick_option(interaction, "🏷️ Alliances — what do you want to do?",
+                           [("Approve a new alliance", "approve", "release it from the Drunk Tank", "✅"),
+                            ("Rename an alliance", "rename", "its R5 or Judge+; renaming onto an existing tag merges", "✏️"),
+                            ("Dissolve an alliance", "dissolve", "Senator+ — deletes it completely", "🧹"),
+                            ("Lock new alliances", "lock", "Senator+ — newcomers with a new tag wait", "🔒"),
+                            ("Unlock new alliances", "unlock", "Senator+", "🔓"),
+                            ("Open a 10-minute burst window", "burst", "Senator+ — several new alliances at once", "⏱️")], picked)
+
+    @discord.ui.button(label="Fresh start", style=discord.ButtonStyle.danger, emoji="🔄", custom_id="rc_desk_freshstart", row=2)
+    async def freshstart(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction, "senior"):
+            return
+
+        async def picked(i, v):
+            invite = v.endswith("_invite")
+            if v.startswith("here"):
+                await _pick_member(i, "🔄 Who gets the fresh start?", lambda j, m: _rescue_button_pressed(j, m.id, invite_back=invite))
+            else:
+                async def typed(j, vals):
+                    uid = _parse_user_id(vals["uid"])
+                    if uid is None:
+                        await _reply(j, "❌ That doesn't look like a Discord ID — it's a long number. Right-click the person → **Copy User ID**.")
+                        return
+                    await _rescue_button_pressed(j, uid, invite_back=invite)
+                await _ask_text(i, "Fresh start for someone who left", [("uid", "Their Discord user ID", "Right-click them → Copy User ID", True, 25, "")], typed)
+        await _pick_option(interaction, "🔄 Fresh start — wipes everything RoboCop stores about one person, lifts a ban, restarts them at question 1.",
+                           [("Someone here", "here", None, "👤"),
+                            ("Someone here + DM them a new invite", "here_invite", None, "📨"),
+                            ("Someone who left (paste their ID)", "gone", None, "🆔"),
+                            ("Someone who left + a one-use invite", "gone_invite", None, "📨")], picked)
+
+    @discord.ui.button(label="Make them register", style=discord.ButtonStyle.secondary, emoji="📝", custom_id="rc_desk_enforce", row=2)
+    async def enforce(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._ok(interaction):
+            await _pick_member(interaction, "📝 Who has to register right now?", lambda i, m: admin_tools_cmd.callback(i, "enforce", None, None, m, None, None, None))
+
+    # ---------------- row 3: lists & levers
+    @discord.ui.button(label="Lookup", style=discord.ButtonStyle.secondary, emoji="🔍", custom_id="rc_desk_lookup", row=3)
+    async def lookup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+
+        async def picked(i, v):
+            if v == "role":
+                await _pick_role(i, "🎭 Which role?", lambda j, role: lookup_cmd.callback(j, "role", role, None))
+            elif v.startswith("field:"):
+                await lookup_cmd.callback(i, "field", None, v.split(":", 1)[1])
+            else:
+                await lookup_cmd.callback(i, v, None, None)
+        await _pick_option(interaction, "🔍 Which list?",
+                           [("Banned users", "banned", "with reasons", "⛔"),
+                            ("Everyone holding a role", "role", None, "🎭"),
+                            ("Everyone by alliance tag", "field:alliance_tag", None, "🏷️"),
+                            ("Everyone by server", "field:server_number", None, "📟"),
+                            ("Everyone by rank", "field:rank_designation", None, "🎖️"),
+                            ("Everyone by in-game name", "field:in_game_name", None, "🔤"),
+                            ("Usage stats", "usage", "translations, games, RPS totals", "📈")], picked)
+
+    @discord.ui.button(label="Settings", style=discord.ButtonStyle.secondary, emoji="⚙️", custom_id="rc_desk_settings", row=3)
+    async def settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction, "senior"):
+            return
+        opts = [(meta["label"][:100], key) for key, meta in CONFIGURABLE_SETTINGS.items()] + [(label[:100], key) for key, label in _EXTRA_SETTINGS.items()]
+
+        async def picked(i, key):
+            label = CONFIGURABLE_SETTINGS[key]["label"] if key in CONFIGURABLE_SETTINGS else _EXTRA_SETTINGS[key]
+            if key == "monthly_prize":
+                await i.response.send_modal(PrizeModal())
+                return
+            hint = "on or off" if key in ("staff_duty_dm", "innovator_program", "rogue_bot_program") else \
+                   "urgent, all or off" if key == "staff_dms" else \
+                   "e.g. 21,121 or 10-15" if key == "managed_servers" else "Blank = just show the current value"
+
+            async def typed(j, v):
+                await settings_cmd.callback(j, key, v["value"] or None)
+            await _ask_text(i, label[:45], [("value", "New value (blank = just show it)", hint, False, 200, "")], typed)
+        await _pick_option(interaction, "⚙️ Which setting? (Next: a box for the new value — leave it blank to just see the current one.)", opts, picked, placeholder="Which setting?")
+
+    @discord.ui.button(label="Big tools", style=discord.ButtonStyle.secondary, emoji="🧰", custom_id="rc_desk_admintools", row=3)
+    async def admintools(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+
+        async def picked(i, tool):
+            if tool == "addrole":
+                async def typed(j, v):
+                    await admin_tools_cmd.callback(j, "addrole", None, None, None, v["role"], v["description"], None)
+                await _ask_text(i, "Add a role to the request menu",
+                                [("role", "Role name (exactly as it appears)", "", True, 100, ""),
+                                 ("description", "One line explaining it", "", True, 200, "")], typed)
+            elif tool == "adopt":
+                async def typed(j, v):
+                    await admin_tools_cmd.callback(j, "adopt", v["tag"], None, None, None, None, None)
+                await _ask_text(i, "Adopt an existing alliance", [("tag", "Its tag (add -server if needed, e.g. HAL-121)", "e.g. HAL", True, 12, "")], typed)
+            elif tool == "bulk":
+                async def typed(j, v):
+                    await admin_tools_cmd.callback(j, "bulk", v["tag"], v["servers"], None, None, None, None)
+                await _ask_text(i, "Bulk-onboard everyone as one alliance",
+                                [("tag", "Alliance tag", "e.g. PTD", True, 8, ""), ("servers", "Server number(s)", "e.g. 21", True, 40, "")], typed)
+            else:
+                await admin_tools_cmd.callback(i, tool, None, None, None, None, None, None)
+        await _pick_option(interaction, "🧰 The rare, big levers. Each one explains itself and asks first.",
+                           [("Re-check every nickname", "nicks", "Judge+ — audit with fix buttons", "✏️"),
+                            ("Add a role to the request menu", "addrole", "Senator+", "🛠️"),
+                            ("Announce the update", "announce", "Dictator — the 'new version' post", "📣"),
+                            ("Database panel", "db", "Dictator — release prisoners / reset", "🗄️"),
+                            ("Adopt an existing alliance", "adopt", "Dictator — fold its channels in", "🏷️"),
+                            ("Migrate legacy roles", "migrate", "Dictator", "🎖️"),
+                            ("Bulk-onboard everyone", "bulk", "Dictator — one alliance, one server", "📋")], picked)
+
+
+async def announce_to_alliance(interaction: discord.Interaction, key: str, message: str):
+    """One announcement into every channel of one alliance (used by the
+    alliance desk when a staff member presses it — announce() itself would
+    go server-wide for them)."""
+    guild = interaction.guild
+    cat = discord.utils.get(guild.categories, name=f"{key} CHATS")
+    targets = list(cat.text_channels) if cat else []
+    if not targets:
+        await _reply(interaction, f"❌ Couldn't find [{tag_display(key)}]'s channels.")
+        return
+    embed = discord.Embed(title="🚨 ANNOUNCEMENT FROM COMMAND 🚨", description=message, color=discord.Color.blue(), timestamp=datetime.now())
+    embed.set_footer(text=f"Announced by {interaction.user.display_name}")
+    await interaction.response.send_message(f"📢 Broadcasting to **[{tag_display(key)}]**'s channels ({len(targets)})...", ephemeral=True)
+    sent = 0
+    for ch in targets:
+        try:
+            await ch.send(embed=embed)
+            sent += 1
+        except discord.HTTPException:
+            pass
+    await interaction.followup.send(f"✅ Sent to {sent} channel(s).", ephemeral=True)
+    await log_event(guild, f"📢 **ANNOUNCEMENT BROADCAST**\nBy: {interaction.user.mention}\nScope: **[{tag_display(key)}]**'s channels\nChannels reached: {sent}\nMessage: {message[:500]}")
+
+
+def _alliance_key_for_channel(channel) -> Optional[str]:
+    """The alliance whose `[TAG] CHATS` category this channel sits in."""
+    cat = getattr(channel, "category", None)
+    if cat and cat.name.endswith(" CHATS"):
+        return cat.name[:-len(" CHATS")]
+    return None
+
+
+class AllianceDeskView(discord.ui.View):
+    """Buttons on each alliance's pinned leadership-chat notice. The alliance
+    is read from the channel, so one static view serves every alliance.
+    R5 (or R4 for the lighter ones), or staff."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _ctx(self, interaction: discord.Interaction, need_r5=True):
+        if await busy_reject_component(interaction):
+            return None
+        key = _alliance_key_for_channel(interaction.channel)
+        if not key:
+            await _reply(interaction, "❓ This button only works inside an alliance's own channels.")
+            return None
+        m = interaction.user
+        names = {r.name for r in getattr(m, "roles", [])}
+        is_r5 = f"{key}-R5" in names
+        is_r4 = f"{key}-R4" in names
+        if not (is_staff_member(m) or is_r5 or (is_r4 and not need_r5)):
+            await _reply(interaction, f"🚫 That one's for [{tag_display(key)}]'s R5{'' if need_r5 else ' or R4'}, Chief.")
+            return None
+        return key
+
+    @discord.ui.button(label="Leadership access", style=discord.ButtonStyle.primary, emoji="🗝️", custom_id="rc_adesk_leadership", row=0)
+    async def leadership(self, interaction: discord.Interaction, button: discord.ui.Button):
+        key = await self._ctx(interaction)
+        if not key:
+            return
+
+        async def picked(i, action):
+            await _pick_member(i, f"🗝️ Who? ({action} leadership-chat access in [{tag_display(key)}])", lambda j, m: leadership_cmd.callback(j, action, m))
+        await _pick_option(interaction, "🗝️ Let someone into this chat (or take it away) without changing their rank.",
+                           [("Grant access", "grant", None, "🔓"), ("Revoke access", "revoke", None, "🔒")], picked)
+
+    @discord.ui.button(label="Announce to my alliance", style=discord.ButtonStyle.primary, emoji="📢", custom_id="rc_adesk_announce", row=0)
+    async def announce_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        key = await self._ctx(interaction)
+        if not key:
+            return
+
+        async def typed(j, v):
+            if is_staff_member(j.user):
+                # announce() would broadcast server-wide for staff; from THIS desk it means this alliance only.
+                await announce_to_alliance(j, key, v["text"])
+            else:
+                await announce.callback(j, "message", v["text"])
+        await _ask_text(interaction, f"Announcement to [{tag_display(key)}]",
+                        [("text", "Your announcement", "Posted in every one of your alliance's channels", True, 1500, "")], typed)
+
+    @discord.ui.button(label="Rename our tag", style=discord.ButtonStyle.secondary, emoji="✏️", custom_id="rc_adesk_rename", row=0)
+    async def rename(self, interaction: discord.Interaction, button: discord.ui.Button):
+        key = await self._ctx(interaction)
+        if not key:
+            return
+
+        async def typed(j, v):
+            await alliance_cmd.callback(j, "rename", key, v["new_tag"])
+        await _ask_text(interaction, f"Rename [{tag_display(key)}]", [("new_tag", "New tag (2–4 letters)", "e.g. PTD", True, 4, "")], typed)
+
+    @discord.ui.button(label="Our roster", style=discord.ButtonStyle.secondary, emoji="👥", custom_id="rc_adesk_roster", row=1)
+    async def roster(self, interaction: discord.Interaction, button: discord.ui.Button):
+        key = await self._ctx(interaction, need_r5=False)
+        if not key:
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        tag_role = discord.utils.get(guild.roles, name=key)
+        members = sorted(tag_role.members, key=lambda m: m.display_name.lower()) if tag_role else []
+        r5 = {m.id for m in getattr(discord.utils.get(guild.roles, name=f"{key}-R5"), "members", [])}
+        r4 = {m.id for m in getattr(discord.utils.get(guild.roles, name=f"{key}-R4"), "members", [])}
+        lines = [f"{'👑' if m.id in r5 else '🎖️' if m.id in r4 else '•'} {m.display_name}" for m in members]
+        text = f"👥 **[{tag_display(key)}] — {len(members)} member(s)** (👑 R5 · 🎖️ R4)\n" + ("\n".join(lines) if lines else "(nobody holds the tag role yet)")
+        await send_long(interaction.followup, text, ephemeral=True)
+
+    @discord.ui.button(label="Alliance standings", style=discord.ButtonStyle.secondary, emoji="📊", custom_id="rc_adesk_standings", row=1)
+    async def standings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await busy_reject_component(interaction):
+            return
+        await alliance_leaderboard(interaction)
+
+    @discord.ui.button(label="How this works", style=discord.ButtonStyle.secondary, emoji="❓", custom_id="rc_adesk_help", row=1)
+    async def howto(self, interaction: discord.Interaction, button: discord.ui.Button):
+        key = _alliance_key_for_channel(interaction.channel) or "TAG"
+        await _reply(interaction,
+                     f"🎖️ **Running [{tag_display(key)}] — the R5 desk**\n"
+                     f"• 🗝️ **Leadership access** — let a trusted member into this chat, or take it away. Doesn't change ranks.\n"
+                     f"• 📢 **Announce** — one message into every [{tag_display(key)}] channel (once every {ANNOUNCE_R5_COOLDOWN_SECONDS // 60} min).\n"
+                     f"• ✏️ **Rename our tag** — roles, channels and every member's record follow. Renaming onto an existing tag merges the two (the owner confirms).\n"
+                     f"• 👥 **Our roster** — who's in, with ranks. 📊 **Standings** — alliances by size.\n"
+                     f"• **Ranks:** members ask for R4 with `/request-rank` in #⚙️-role-requests; you approve R4s from the buttons on that request. R5 needs staff.\n"
+                     f"• Anything else (a member's wrong name or server, someone stuck): ask a Judge — they have a desk of their own.")
+
+
+class PlayPanelView(discord.ui.View):
+    """Buttons on the pinned notice in #🌍-everyone-chat — the games, one tap."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _ok(self, interaction: discord.Interaction) -> bool:
+        return not await busy_reject_component(interaction)
+
+    @discord.ui.button(label="Challenge someone to RPS", style=discord.ButtonStyle.primary, emoji="✂️", custom_id="rc_play_rps", row=0)
+    async def rps_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._ok(interaction):
+            await _pick_member(interaction, "✂️ Who are you calling out?", lambda i, m: rps.callback(i, m), placeholder="Pick your opponent…")
+
+    @discord.ui.button(label="RPS vs RoboCop", style=discord.ButtonStyle.secondary, emoji="🤖", custom_id="rc_play_rps_bot", row=0)
+    async def rps_bot(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._ok(interaction):
+            await rps.callback(interaction, None)
+
+    @discord.ui.button(label="Today's Case File", style=discord.ButtonStyle.secondary, emoji="🗂️", custom_id="rc_play_case", row=0)
+    async def case(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ok(interaction):
+            return
+        st = await _case_state(interaction.guild)
+        if st and st.get("q"):
+            solved = str(st.get("solved_by") or "")
+            if solved.isdigit():
+                tail = f"✅ Already cracked by <@{solved}>."
+            elif solved:
+                tail = "⏳ Time ran out on this one — nobody cracked it. A fresh case drops on schedule."
+            else:
+                tail = f"Just type your answer in this channel — first right answer wins {ACHIEVEMENT_WEIGHTS['case_solved']} points."
+            await _reply(interaction, f"🗂️ **Today's Case File**\n> {st['q']}\n\n{tail}")
+        else:
+            await _reply(interaction, "🗂️ No case on the board right now — the next one drops on schedule. Ask a Judge to open one early if you're itching.")
+
+    @discord.ui.button(label="Am I in the chase?", style=discord.ButtonStyle.secondary, emoji="🕵️", custom_id="rc_play_chase", row=0)
+    async def chase(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._ok(interaction):
+            await chase_status(interaction)
+
+    @discord.ui.button(label="My score & the prize", style=discord.ButtonStyle.success, emoji="📊", custom_id="rc_play_stats", row=0)
+    async def stats(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._ok(interaction):
+            await stats_cmd(interaction)
+
+
+async def attach_alliance_desks_once(guild):
+    """(10.2) First boot with the desks: put the buttons on every alliance's
+    pinned leadership-chat notice (refresh_leadership_status does it from
+    then on whenever ranks change)."""
+    if await get_guild_setting(guild.id, "alliance_desks_attached") == "1":
+        return
+    for key in await _known_alliance_keys():
+        try:
+            await refresh_leadership_status(guild, key)
+        except Exception as e:
+            print(f"[DESK] Couldn't attach the alliance desk for {key}: {type(e).__name__}: {e}")
+    await set_guild_setting(guild.id, "alliance_desks_attached", "1")
 
 
 # ============================================================
