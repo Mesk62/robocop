@@ -5911,6 +5911,7 @@ CH_SETTINGS_NOTICE = (
     "🕵️ **Cops & Robbers** — everyone's in the daily manhunt, in turn (roles arrive in a private thread, never a DM). **Count me in** = front of the line; **Not for me** = sit out. How it all works: **#🎮-how-to-play**. (`/chase join` / `/chase leave`)\n"
     "🌐 **Translate anything** — react with 🌐 on any message and I'll DM you a translation. Nothing to set up.\n"
     "🛡️ **What I keep about you** — the full, honest list, and what I'll never ask for. (`/safety`)\n"
+    "📊 **Your score & the prize** — your record, this month's race and every leaderboard, one tap each. (`/stats`)\n"
     "❓ **Everything you can do** — your personal rundown, updated as you gain roles. (`/help`)"
 )
 
@@ -6025,6 +6026,11 @@ class SettingsPanelView(discord.ui.View):
     async def nicknames(self, interaction: discord.Interaction, button: discord.ui.Button):
         if await self._guard(interaction):
             await nickname_cmd(interaction)
+
+    @discord.ui.button(label="My score & the prize", style=discord.ButtonStyle.success, emoji="📊", custom_id="rc_settings_stats")
+    async def stats(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._guard(interaction):
+            await stats_cmd(interaction)
 
     @discord.ui.button(label="Cops & Robbers: in or out", style=discord.ButtonStyle.secondary, emoji="🕵️", custom_id="rc_settings_chase")
     async def chase(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -9738,7 +9744,7 @@ async def handle_member_join(member):
             f"• React 🌐 on any message for a private translation.\n"
             f"• **#🌍-everyone-chat** is where everyone from every server hangs out — and where the games happen.\n"
             f"• 🏆 **You're already in the games.** Nothing to join: Cops & Robbers drafts you (your role appears in a private thread), the Daily Case File is a riddle you answer in chat, and the Rogue RoboCop is anyone's to `/catch`. "
-            f"Points win the monthly prize — `/stats view:monthly` shows it, **#🎮-how-to-play** explains everything. Rather not play? #⚙️-settings → Not for me.",
+            f"Points win the monthly prize — `/stats` shows it, **#🎮-how-to-play** explains everything. Rather not play? #⚙️-settings → Not for me.",
             member.id
         )
         welcome_embed.add_field(name="📍 Where To Find Things", value=where_to_find_info[:1024], inline=False)
@@ -13065,6 +13071,43 @@ async def catch_cmd(interaction: discord.Interaction, name: str):
         await interaction.followup.send(random.choice(CHASE_COLD_FLAVOR) + left_note, ephemeral=True)
 
 
+class StatsMenuView(discord.ui.View):
+    """(10.2) Buttons under `/stats`, so nobody has to learn the view: options.
+    One tap for each board; Senators and up also get '✏️ Set the prize'."""
+
+    def __init__(self, user):
+        super().__init__(timeout=600.0)
+        self.user = user
+        if not (isinstance(user, discord.Member) and is_senior_staff_member(user)):
+            self.remove_item(self.prize)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("🚔 Those buttons belong to someone else — type `/stats` for your own.", ephemeral=True)
+            return False
+        return not await busy_reject_component(interaction)
+
+    @discord.ui.button(label="Top 10", style=discord.ButtonStyle.primary, emoji="🏆", row=0)
+    async def top10(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await leaderboard_cmd(interaction)
+
+    @discord.ui.button(label="This month + prize", style=discord.ButtonStyle.primary, emoji="📅", row=0)
+    async def monthly(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await monthly_standings_cmd(interaction)
+
+    @discord.ui.button(label="Game totals", style=discord.ButtonStyle.secondary, emoji="🎮", row=1)
+    async def games(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await game_stats(interaction)
+
+    @discord.ui.button(label="Alliances", style=discord.ButtonStyle.secondary, emoji="🏰", row=1)
+    async def alliances(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await alliance_leaderboard(interaction)
+
+    @discord.ui.button(label="Set the prize", style=discord.ButtonStyle.success, emoji="✏️", row=2)
+    async def prize(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PrizeModal())
+
+
 async def stats_cmd(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
@@ -13115,9 +13158,11 @@ async def stats_cmd(interaction: discord.Interaction):
         value=f"**{my_score}** points" + (f" — ranked **#{rank}**" if rank else " — not on the board yet, get out there!"),
         inline=False
     )
-    embed.set_footer(text=SCORING_LINE + " · RPS and Innovator are for glory, not points")
+    prize = await get_guild_setting(guild.id, "monthly_prize") or DEFAULT_MONTHLY_PRIZE
+    embed.add_field(name="🎁 This month's prize", value=prize[:1024], inline=False)
+    embed.set_footer(text=SCORING_LINE + " · RPS and Innovator are for glory, not points · tap a button for more")
 
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, view=StatsMenuView(interaction.user), ephemeral=True)
 
 
 async def leaderboard_cmd(interaction: discord.Interaction):
@@ -13810,7 +13855,7 @@ async def prize_line(guild) -> str:
         m = guild.get_member(standings[0][0])
         if m:
             lead = f" · Leading this month: **{m.display_name}** ({standings[0][1]} pts)"
-    return f"🏆 **This month's prize:** {prize}\n{SCORING_LINE}{lead} · `/stats view:monthly`"
+    return f"🏆 **This month's prize:** {prize}\n{SCORING_LINE}{lead} · standings: `/stats`"
 
 
 _leaderboard_cache = {}  # guild_id -> (monotonic_timestamp, results)
@@ -15019,8 +15064,8 @@ async def chase_cmd(interaction: discord.Interaction, action: str = "status"):
 
 
 # ---------------------------------------------------------------- /stats
-@bot.tree.command(name="stats", description="Scores and standings: yours, the top 10, this month's race, game totals, or alliances by size.")
-@app_commands.describe(view="Blank = your own record.")
+@bot.tree.command(name="stats", description="Your score, the prize, and buttons for every leaderboard. Just type /stats and press Enter.")
+@app_commands.describe(view="Optional — skip it. /stats alone shows your record with a button for each board.")
 @app_commands.choices(view=[
     app_commands.Choice(name="me — my record and rank (default)", value="me"),
     app_commands.Choice(name="top10 — the server's all-time top 10", value="top10"),
@@ -15151,12 +15196,12 @@ HOWDO_TASKS = [
     ("Play Rock-Paper-Scissors", "everyone", "rps rock paper scissors play game duel",
      "`/rps` (against RoboCop) or `/rps opponent:@someone`."),
     ("See scores and leaderboards", "everyone", "stats score leaderboard top 10 monthly standings rank me",
-     "`/stats` (yours), `/stats view:top10`, `view:monthly` (this month's race and the prize), `view:games`, `view:alliances`."),
+     "Type `/stats` and press Enter — your record and this month's prize, with a button for Top 10, This month, Game totals and Alliances. Or #⚙️-settings → 📊."),
     ("How points and the prize work", "everyone", "points how do points work prize what is the prize win scoring score monthly champion gift card",
      f"{SCORING_LINE}. RPS and the Innovator badge are for glory only. "
-     "The prize and live standings: `/stats view:monthly`. Winners are announced on the 1st."),
+     "The prize and live standings: `/stats`, then tap 📅. Winners are announced on the 1st."),
     ("Set the monthly prize", "senior", "set prize change prize monthly prize gift card reward announce prize",
-     "`/stats view:monthly` → tap **✏️ Change the prize** (Senator+), or `/settings setting:monthly_prize value:...`. "
+     "Type `/stats` and press Enter → tap **✏️ Set the prize** (Senator+). Or #⚙️-settings → 📊 **My score & the prize**. "
      "It's shown every time a game starts and in the monthly announcement."),
     ("Set my time zone or language", "everyone", "timezone time zone language set my language",
      "#⚙️-settings has a button for each, or `/timezone` and `/language`."),
