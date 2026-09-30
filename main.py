@@ -5396,7 +5396,8 @@ PRIVACY_NOTE = (
     "Also good to know: posts in #🐛-bugs and #💡-suggestions are copied to the staff log, and when you ask "
     "me to translate a message (🌐), its text is sent to Google Translate to do it — nothing is saved. When you "
     "first register I look up words that rhyme with your in-game name (Datamuse, a free dictionary service — just "
-    "the name is sent) for your welcome rhyme. I notice "
+    "the name is sent) for your welcome rhyme. If the server has an AI helper switched on, a `/help` question my own guide "
+    "can't answer is sent to it (just the question, no names), and it writes the Daily Case File riddles. I notice "
     "when you come online so I can give the top 10 a public shout-out, but I don't record it.\n\n"
     "**What I never collect:** no real name, address, phone number, email, location or payment details, "
     "and I don't save your chat messages. Just a robot with a very short notepad. 🤖📝"
@@ -5964,7 +5965,7 @@ def game_rules_text(game: str) -> str:
             f"Every day RoboCop posts a short case in #{CH_EVERYONE}: a riddle, a word puzzle, a bit of precinct logic.\n\n"
             "**How to play**\n"
             "• Just **type your answer in chat** — no command needed. RoboCop is listening.\n"
-            "• The **first correct answer** closes the case. Everyone can try as often as they like.\n"
+            "• The **first correct answer** closes the case — close spelling counts, so no need to be perfect. Everyone can try as often as they like.\n"
             "• If nobody cracks it by the next case, the answer is revealed.\n\n"
             f"**Points:** solving a case is worth **{w['case_solved']}**. Works with 3 people or 300."
         )
@@ -8304,6 +8305,25 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     if after.id in _onboarding_in_progress:
         return  # the final onboarding DM already covers this — no spam mid-flow
 
+    # (10.2) Anything above Member gets a party: honorary roles and
+    # leadership-chat access don't change the capability tier, so they're
+    # spotted straight from the role diff (and remembered the same way).
+    new_roles = {r.name for r in after.roles} - {r.name for r in before.roles}
+    special = [n for n in new_roles if n in HONORARY_FANFARE] + [n for n in new_roles if n.endswith("-Leadership")]
+    special += [r.name for r in after.roles if r.name in new_roles and _is_custom_role(after.guild, r)]
+    if special and _is_leader and not server_is_busy():
+        async with db_connect() as conn:
+            cur = await conn.cursor()
+            await cur.execute("SELECT capability FROM capability_notifications WHERE user_id = ?", (after.id,))
+            seen = {row[0] for row in await cur.fetchall()}
+        fresh = [n for n in special if f"role:{n}" not in seen]
+        if fresh:
+            await mark_capabilities_notified(after.id, [f"role:{n}" for n in fresh])
+            try:
+                await post_promotion_fanfare(after.guild, after, fresh[0])
+            except Exception as e:
+                await report_error(after.guild, "promotion fanfare", after, e)
+
     caps_after, caps_before = compute_capabilities(after), compute_capabilities(before)
     gained_raw = [k for k in ORDERED_ABILITY_KEYS if k in caps_after and k not in caps_before]
     if not gained_raw:
@@ -8331,6 +8351,107 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     except discord.HTTPException as e:
         await report_error(after.guild, "clearance-upgrade DM (on_member_update)", after, e)
     await mark_capabilities_notified(after.id, gained)
+    if _is_leader and not server_is_busy():  # no fanfare storm during a bulk migration
+        top = max((k for k in gained if k != "MEMBER"), key=ORDERED_ABILITY_KEYS.index, default=None)
+        if top == "JUDGE" and any(n in HONORARY_FANFARE for n in new_roles):
+            top = None  # the honorary role's own fanfare already went out
+        if top:
+            try:
+                await post_promotion_fanfare(after.guild, after, top)
+            except Exception as e:
+                await report_error(after.guild, "promotion fanfare", after, e)
+
+
+def _is_custom_role(guild, role) -> bool:
+    """A role RoboCop doesn't know — a vanity role the owner made ("Event
+    Winner", "Raid Boss"…). Everything the bot manages itself is excluded,
+    so alliance/server/punishment/rank changes never trigger this path."""
+    n = role.name
+    if role.managed or role.is_default() or role.position >= guild.me.top_role.position:
+        return False
+    known = {ROLE_MEMBER, ROLE_INNOVATOR, ROLE_DRUNK_TANK, ROLE_PRISONER, ROLE_TIMEOUT} | STAFF_ROLE_NAMES | set(HONORARY_FANFARE)
+    if n in known or n.endswith(("-R4", "-R5", "-Leadership")) or n.startswith("🗺️ Server "):
+        return False
+    if any(r.name == f"{n}-R5" or r.name == f"{n}-R4" for r in guild.roles):
+        return False  # an alliance tag role (has rank siblings)
+    return True
+
+
+CUSTOM_ROLE_AI_SYSTEM = (
+    "You write ONE short, warm, funny congratulation (1-2 sentences, max 220 characters) for a member of a friendly "
+    "police-themed game Discord who was just given a new role. Light police/robot humour, never mean, no hashtags, "
+    "no emojis, no quotes around it. Refer to the person as {m} exactly (it will be replaced by a mention) and to the role by its name in bold."
+)
+
+
+async def custom_role_line(guild, member, role_name: str) -> str:
+    text = None
+    if AI_ENABLED:
+        text = await ai_complete(CUSTOM_ROLE_AI_SYSTEM, f"The role is: {role_name}", max_tokens=120)
+        if text and "{m}" in text and len(text) <= 300:
+            text = text.strip().strip('"')
+        else:
+            text = None
+    if not text:
+        text = f"{{m}} just earned the **{role_name}** role. Nobody's entirely sure what it does yet, but it looks fantastic on them."
+    return text.replace("{m}", member.mention)
+
+
+HONORARY_FANFARE = {
+    ROLE_MILLIE: ("✨ 🎆 THE ONE AND ONLY — MILLIE 🎆 ✨", "{m} now carries the **✨ Millie** badge — one of a kind, Judge-level, and the only pink in the entire precinct. Everyone else: don't even try.",
+                  discord.Color.gold(), ["🎉", "✨", "🎆", "🎇"]),  # the embed stays gold — pink belongs to the role itself, nothing else
+    ROLE_STITCH: ("🧵 🎆 STITCH JOINS THE BENCH 🎆 🧵", "{m} has been given the **🧵 Stitch** badge — honorary, Judge-level, and stitched right into the fabric of this place.",
+                  discord.Color.purple(), ["🎉", "🧵", "🎆", "🎇"]),
+    ROLE_CHROME: ("🥈 🎆 CHROME, POLISHED AND SWORN IN 🎆 🥈", "{m} now wears **🥈 Chrome** — honorary, Judge-level, and shinier than the whole motor pool.",
+                  discord.Color.orange(), ["🎉", "🥈", "🎆", "🎇"]),
+    ROLE_SILENT: ("🔥 🎆 SILENT, BUT DEADLY EFFECTIVE 🎆 🔥", "{m} holds the **🔥 Silent** badge — honorary, Judge-level, and the loudest quiet person in the precinct.",
+                  discord.Color.blue(), ["🎉", "🔥", "🎆", "🎇"]),
+}
+PROMOTION_FANFARE = {
+    "R4": ("🎖️ NEW OFFICER ON THE BEAT", "{m} just made **R4** in **[{tag}]**. Someone get this Chief a bigger desk and a slightly less broken chair.",
+           discord.Color.teal(), ["🎉", "🎖️"]),
+    "R5": ("👑 A NEW COMMANDER RISES", "{m} now holds **R5 command** of **[{tag}]**. All units: salute, then go back to what you were doing, but with feeling.",
+           discord.Color.gold(), ["🎉", "👑", "🎆"]),
+    "JUDGE": ("⚖️ 🎆 ORDER IN THE COURT — A NEW JUDGE 🎆 ⚖️", "{m} has been sworn in as a **Judge**. The gavel is heavy, the robe is itchy, and the whole precinct is a little safer tonight.",
+              discord.Color.purple(), ["🎉", "⚖️", "🎆", "🎇"]),
+    "SENATOR": ("🏛️ 🎆 THE SENATE HAS A NEW VOICE 🎆 🏛️", "{m} is now a **Senator**. Speeches optional, snacks mandatory. Fireworks budget: approved.",
+                discord.Color.orange(), ["🎉", "🏛️", "🎆", "🎇", "🥂"]),
+    "DICTATOR": ("👑 🎆 ALL HAIL — A NEW DICTATOR 🎆 👑", "{m} now holds **Dictator** power. Benevolent, we're told. The parade has been scheduled. Attendance is, naturally, compulsory.",
+                 discord.Color.red(), ["🎉", "👑", "🎆", "🎇", "🥂", "🚨"]),
+}
+
+
+async def post_promotion_fanfare(guild, member, key: str):
+    """(10.2) A public celebration in everyone-chat whenever someone gains a
+    rank — once per rank per person (rides on capability_notifications, so a
+    release from jail or a re-grant doesn't fire it twice)."""
+    ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
+    if not ch:
+        return
+    if key in PROMOTION_FANFARE:
+        title, body, color, reactions = PROMOTION_FANFARE[key]
+    elif key in HONORARY_FANFARE:
+        title, body, color, reactions = HONORARY_FANFARE[key]
+    elif key.endswith("-Leadership"):
+        title, body, color, reactions = ("🔑 🎆 KEYS TO THE BACK ROOM 🎆 🔑",
+                                         "{m} has been handed **leadership-chat access** in **[{tag}]**. Big decisions, bigger coffee. Use it wisely.",
+                                         discord.Color.teal(), ["🎉", "🔑", "🎆"])
+    else:  # a custom role — let the AI say something nice (or the built-in line if there's no AI)
+        title, body, color, reactions = (f"🎆 NEW BADGE: {key.upper()} 🎆", await custom_role_line(guild, member, key), discord.Color.green(), ["🎉", "🎆", "🎇"])
+    tag_role = key if key.endswith("-Leadership") else next((r.name for r in member.roles if r.name.endswith(("-R4", "-R5", "-Leadership"))), "")
+    tag = tag_display(tag_role.rsplit("-", 1)[0]) if tag_role else "?"
+    description = body if key not in PROMOTION_FANFARE and key not in HONORARY_FANFARE and not key.endswith("-Leadership") \
+        else body.format(m=member.mention, tag=tag)  # the custom-role line is already filled in (and may contain braces)
+    embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.now())
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="🎆 " + "🎇" * 3 + " 🎆", value=f"*{boss_quip(guild)}*", inline=False)
+    embed.set_footer(text="Congratulations from the whole precinct. Now get back to work.")
+    msg = await ch.send(embed=embed)
+    for r in reactions:
+        try:
+            await msg.add_reaction(r)
+        except discord.HTTPException:
+            break
 
 
 _rogue_last_comment_at = 0.0
@@ -10743,36 +10864,109 @@ async def weekly_precinct_report_scheduler(guild):
 #  guild ("case_state_<gid>" = "index|posted_date|message_id|solved_by").
 # ------------------------------------------------------------
 CASE_FILES = [
-    ("A suspect was seen leaving with something that has keys but opens no locks, space but no room, and you can enter but not go in. What did they take?", ("keyboard", "a keyboard")),
-    ("Detective's note: 'I have cities but no houses, forests but no trees, and water but no fish.' What is the detective holding?", ("map", "a map")),
-    ("Evidence log: the more of this you take, the more you leave behind. What is it?", ("footsteps", "footprints", "steps")),
-    ("The witness says the culprit 'has hands but can't clap, and runs but never walks'. Who — or what — is it?", ("clock", "a clock")),
-    ("Missing from the evidence room: something that goes up but never comes down. What is it?", ("age", "your age", "my age")),
-    ("Precinct lock-up has 3 cells. What can fill a cell without taking any space?", ("light", "sound", "air")),
-    ("What belongs to you but other Chiefs use it more than you do?", ("name", "your name", "my name")),
-    ("Officer's riddle: what gets wetter the more it dries?", ("towel", "a towel")),
-    ("Case #7: the thief took something you can catch but never throw. What?", ("cold", "a cold")),
-    ("Seized item: it has a neck but no head, and it wears a cap. What is it?", ("bottle", "a bottle")),
-    ("An informant says: 'I'm always in front of you, but you'll never see me.' Who is the informant?", ("future", "the future")),
-    ("Something was broken the moment someone said its name. What was it?", ("silence",)),
-    ("What has one eye but can't see, and was found in the sewing kit at the scene?", ("needle", "a needle")),
-    ("Break this code, Chief: what can travel around the world while staying in a corner?", ("stamp", "a stamp", "postage stamp")),
-    ("The precinct's newest recruit has 13 hearts but no other organs. Who is it?", ("deck of cards", "cards", "a deck of cards", "deck")),
-    ("What runs all around the precinct yard but never moves?", ("fence", "a fence", "wall", "a wall")),
-    ("Missing item: it's taller when young and shorter when old. What is it?", ("candle", "a candle")),
-    ("The suspect can be cracked, made, told and played. What is it?", ("joke", "a joke")),
-    ("What kind of room has no doors and no windows — where the getaway driver was hiding?", ("mushroom", "a mushroom")),
-    ("Interrogation: the more you have of it, the less you see. What is it?", ("darkness", "dark", "fog")),
-    ("Something at the scene has a thumb and four fingers but isn't alive. What?", ("glove", "a glove")),
-    ("A patrol clue: what goes up and down the stairs every day without moving?", ("carpet", "a carpet", "stairs carpet", "the carpet", "rug", "a rug")),
-    ("What has a head, a tail, is brown, and has no legs — found in the vault?", ("penny", "a penny", "coin", "a coin")),
-    ("RoboCop's favourite: what can you hold in your right hand but never in your left?", ("left hand", "your left hand", "my left hand", "left elbow")),
-    ("The forger made something that has words but never speaks. What?", ("book", "a book")),
-    ("What kind of band never plays music, but was found on the desk sergeant's wrist?", ("rubber band", "a rubber band", "elastic band", "wristband", "watch band")),
-    ("Reported stolen: it's full of holes but still holds water. What?", ("sponge", "a sponge")),
-    ("Found at the scene: it has many teeth but can't bite. What is it?", ("comb", "a comb", "zipper", "a zipper", "saw", "a saw")),
-    ("The alliance treasurer counted something that is always coming but never arrives. What?", ("tomorrow",)),
-    ("What can fill the whole station but weighs nothing?", ("light", "air", "sound", "noise")),
+    ('A suspect was seen leaving with something that has keys but opens no locks, space but no room, and you can enter but not go in. What did they take?', ('keyboard', 'a keyboard')),
+    ("Detective's note: 'I have cities but no houses, forests but no trees, and water but no fish.' What is the detective holding?", ('map', 'a map')),
+    ('Evidence log: the more of this you take, the more you leave behind. What is it?', ('footsteps', 'footprints', 'steps')),
+    ("The witness says the culprit 'has hands but can't clap, and runs but never walks'. Who — or what — is it?", ('clock', 'a clock')),
+    ('Missing from the evidence room: something that goes up but never comes down. What is it?', ('age', 'your age', 'my age')),
+    ('Precinct lock-up has 3 cells. What can fill a cell without taking any space?', ('light', 'sound', 'air')),
+    ('What belongs to you but other Chiefs use it more than you do?', ('name', 'your name', 'my name')),
+    ("Officer's riddle: what gets wetter the more it dries?", ('towel', 'a towel')),
+    ('Case #7: the thief took something you can catch but never throw. What?', ('cold', 'a cold')),
+    ('Seized item: it has a neck but no head, and it wears a cap. What is it?', ('bottle', 'a bottle')),
+    ("An informant says: 'I'm always in front of you, but you'll never see me.' Who is the informant?", ('future', 'the future')),
+    ('Something was broken the moment someone said its name. What was it?', ('silence',)),
+    ("What has one eye but can't see, and was found in the sewing kit at the scene?", ('needle', 'a needle')),
+    ('Break this code, Chief: what can travel around the world while staying in a corner?', ('stamp', 'a stamp', 'postage stamp')),
+    ("The precinct's newest recruit has 13 hearts but no other organs. Who is it?", ('deck of cards', 'cards', 'a deck of cards', 'deck')),
+    ('What runs all around the precinct yard but never moves?', ('fence', 'a fence', 'wall', 'a wall')),
+    ("Missing item: it's taller when young and shorter when old. What is it?", ('candle', 'a candle')),
+    ('The suspect can be cracked, made, told and played. What is it?', ('joke', 'a joke')),
+    ('What kind of room has no doors and no windows — where the getaway driver was hiding?', ('mushroom', 'a mushroom')),
+    ('Interrogation: the more you have of it, the less you see. What is it?', ('darkness', 'dark', 'fog')),
+    ("Something at the scene has a thumb and four fingers but isn't alive. What?", ('glove', 'a glove')),
+    ('A patrol clue: what goes up and down the stairs every day without moving?', ('carpet', 'a carpet', 'stairs carpet', 'the carpet', 'rug', 'a rug')),
+    ('What has a head, a tail, is brown, and has no legs — found in the vault?', ('penny', 'a penny', 'coin', 'a coin')),
+    ("RoboCop's favourite: what can you hold in your right hand but never in your left?", ('left hand', 'your left hand', 'my left hand', 'left elbow')),
+    ('The forger made something that has words but never speaks. What?', ('book', 'a book')),
+    ("What kind of band never plays music, but was found on the desk sergeant's wrist?", ('rubber band', 'a rubber band', 'elastic band', 'wristband', 'watch band')),
+    ("Reported stolen: it's full of holes but still holds water. What?", ('sponge', 'a sponge')),
+    ("Found at the scene: it has many teeth but can't bite. What is it?", ('comb', 'a comb', 'zipper', 'a zipper', 'saw', 'a saw')),
+    ('The alliance treasurer counted something that is always coming but never arrives. What?', ('tomorrow',)),
+    ("What has keys that open no locks, and a lock that keys can't open? Found on the desk sergeant's desk.", ('piano', 'a piano')),
+    ("The suspect has four legs, one back and no body, and can't walk. What is it?", ('chair', 'a chair')),
+    ('Interrogation room riddle: what can you keep after giving it to someone?', ('your word', 'word', 'a promise', 'promise')),
+    ('What has to be broken before you can use it? Found in the precinct kitchen.', ('egg', 'an egg', 'eggs')),
+    ("A witness says the getaway vehicle 'has a bed but never sleeps, and runs but never walks'. What is it?", ('river', 'a river')),
+    ('What has lots of eyes but cannot see, and was found in the evidence sack?', ('potato', 'a potato', 'potatoes')),
+    ('Case note: the more you take away from it, the bigger it gets. What is it?', ('hole', 'a hole')),
+    ('What has a ring but no finger, and was found ringing in the station?', ('telephone', 'phone', 'a phone', 'a telephone')),
+    ('What kind of coat is always put on wet? The painter at the scene knows.', ('paint', 'coat of paint', 'a coat of paint')),
+    ('The suspect goes up and down but never moves. What is it?', ('staircase', 'stairs', 'the stairs', 'a staircase')),
+    ("Something at the scene gets bigger the more you take from it, and it's not a hole this time — what is a debt's cousin? Actually, simpler: what has a bottom at the top?", ('legs', 'your legs', 'leg')),
+    ('What building has the most stories in town? The librarian is a suspect.', ('library', 'a library', 'the library')),
+    ('What can you break without touching it, and the interrogator just did it?', ('a promise', 'promise', 'silence', 'the silence')),
+    ('Precinct puzzle: what gets sharper the more you use it?', ('brain', 'your brain', 'the brain', 'mind', 'your mind')),
+    ('The suspect can fly without wings and cry without eyes. What is it?', ('cloud', 'a cloud', 'clouds')),
+    ('What has one head, one foot and four legs? Found in the barracks.', ('bed', 'a bed')),
+    ("What is so light that even the strongest officer can't hold it for more than a few minutes?", ('breath', 'your breath', 'his breath')),
+    ('Something at the crime scene has a tongue but cannot taste. What?', ('shoe', 'a shoe', 'shoes')),
+    ('What has an eye but cannot see, and a storm chaser would know?', ('hurricane', 'a hurricane', 'tornado', 'a tornado', 'needle', 'a needle')),
+    ('What kind of key opens a banana? The grocer is a witness.', ('monkey', 'a monkey', 'monkey key')),
+    ('Which month of the year has 28 days?', ('all of them', 'every month', 'all', 'all months', 'every one')),
+    ("Sergeant's riddle: what invention lets you look right through a wall?", ('window', 'a window')),
+    ('What goes through cities and fields but never moves?', ('road', 'a road', 'roads', 'highway', 'a highway')),
+    ("The forger's tool has a head and a tail but no body. What is it?", ('coin', 'a coin')),
+    ("What has legs but doesn't walk, and a top but no bottom? Found in the interview room.", ('table', 'a table')),
+    ('What five-letter word becomes shorter when you add two letters to it?', ('short',)),
+    ('What starts with T, ends with T, and has T in it?', ('teapot', 'a teapot')),
+    ("Officer's puzzle: what word is spelled wrong in every dictionary?", ('wrong',)),
+    ('What kind of ship has two mates but no captain?', ('relationship', 'a relationship', 'friendship', 'a friendship')),
+    ("What has a heart that doesn't beat? Found in the fruit bowl.", ('artichoke', 'an artichoke', 'lettuce', 'a lettuce')),
+    ('What can be measured but has no length, width or height?', ('time', 'temperature')),
+    ("What can you hear but not touch or see, and it's what the witness gave us?", ('voice', 'a voice', 'your voice', 'sound')),
+    ('Break the code: what word contains 26 letters but only has three syllables?', ('alphabet', 'the alphabet')),
+    ('What is at the end of a rainbow? The suspect was seen there.', ('the letter w', 'w', 'letter w')),
+    ('What begins with an E, ends with an E, and usually contains only one letter?', ('envelope', 'an envelope')),
+    ("What can go up a chimney down, but can't go down a chimney up?", ('umbrella', 'an umbrella')),
+    ('What has a neck but no head, two arms but no hands? Found in the locker room.', ('shirt', 'a shirt', 'jacket', 'a jacket')),
+    ("What kind of cup doesn't hold water? The bakery is a suspect.", ('cupcake', 'a cupcake', 'hiccup')),
+    ('Precinct riddle: what has a bark but no bite?', ('tree', 'a tree')),
+    ('What kind of tree fits in your hand? The suspect was holding one.', ('palm', 'a palm', 'palm tree')),
+    ('What has four wheels and flies? Found behind the cafeteria.', ('garbage truck', 'a garbage truck', 'rubbish truck', 'bin lorry', 'garbage lorry')),
+    ("The witness wrote: 'What has a foot on each side and one in the middle?' What is it?", ('yardstick', 'a yardstick', 'ruler', 'a ruler')),
+    ("Sergeant's brain-teaser: I have branches but no fruit, trunk or leaves. What am I?", ('bank', 'a bank')),
+    ("What has many needles but can't sew? Found in the yard.", ('pine tree', 'a pine tree', 'christmas tree', 'a christmas tree', 'hedgehog', 'a hedgehog', 'cactus', 'a cactus')),
+    ('What comes once in a minute, twice in a moment, but never in a thousand years?', ('the letter m', 'm', 'letter m')),
+    ('What is black when you buy it, red when you use it, and grey when you throw it away?', ('charcoal', 'coal')),
+    ('I have no life, but I can die. What am I?', ('battery', 'a battery')),
+    ('What kind of dog never bites, and was found at the fair?', ('hot dog', 'a hot dog', 'hotdog')),
+    ('What kind of nut has no shell? The officer had one for lunch.', ('doughnut', 'donut', 'a donut', 'a doughnut')),
+    ('What kind of lion never roars? The safari guide is a suspect.', ('dandelion', 'a dandelion', 'sea lion', 'a sea lion')),
+    ('Where does today come before yesterday? The librarian knows.', ('dictionary', 'a dictionary', 'the dictionary')),
+    ("Evidence bag #21: I get shorter the longer I stand. What am I? (Not a candle — the candle's in custody.)", ('pencil', 'a pencil')),
+    ("What has a head, can't think, and lives in the toolbox?", ('hammer', 'a hammer', 'nail', 'a nail')),
+    ("Detective's puzzle: what has teeth but never eats, and lives on the desk sergeant's keyring?", ('key', 'a key', 'keys')),
+    ('What flies all day but never goes anywhere? Look up at the precinct roof.', ('flag', 'a flag')),
+    ('What has a bridge and strings but carries no traffic?', ('guitar', 'a guitar', 'violin', 'a violin')),
+    ('What is easy to get into but hard to get out of? Every recruit finds out.', ('trouble',)),
+    ('What kind of coat has no buttons and no sleeves, and dries in a day?', ('coat of paint', 'paint', 'a coat of paint')),
+    ('What has arms and legs but no body or head? Found in the break room.', ('armchair', 'an armchair', 'chair', 'a chair')),
+    ("What do you bury when it's alive and dig up when it's dead? The gardener is a suspect.", ('plant', 'a plant', 'seed', 'a seed', 'potato', 'a potato')),
+    ('What gets paid without doing any work? Found in the finance office.', ('bill', 'a bill', 'bills')),
+    ("What has wings but isn't a bird, and lives in the precinct kitchen?", ('chicken', 'a chicken', 'chicken wings', 'airplane', 'a plane')),
+    ('The suspect grows down while growing up. What is it?', ('goose', 'a goose', 'duck', 'a duck', 'feathers')),
+    ('What can you make that nobody can see, not even you? The sergeant makes a lot of it.', ('noise', 'a noise', 'sound')),
+    ("What has ten letters and starts with gas? (Yes, the officer's car is involved.)", ('automobile', 'an automobile')),
+    ("What has a bell but can't ring, and it's parked out front?", ('bicycle', 'a bicycle', 'bike', 'a bike')),
+    ("What has three feet but can't walk? Found in the surveyor's kit.", ('yard', 'a yard', 'yardstick', 'a yardstick')),
+    ('What starts with P, ends with E, and has thousands of letters?', ('post office', 'a post office', 'the post office')),
+    ('What has a mouth but never eats, and a shore but no sea?', ('lake', 'a lake')),
+    ("What has no beginning, no end and no middle, and the doughnut delivery driver swears it isn't food?", ('circle', 'a circle', 'ring', 'a ring')),
+    ('What kind of stone can never be found in the evidence river, however hard you look?', ('dry stone', 'a dry stone', 'dry one', 'a dry one')),
+    ('What word looks the same upside down and backwards? The forger uses it a lot.', ('swims',)),
+    ('What is at the centre of gravity? The physics teacher is a suspect.', ('the letter v', 'v', 'letter v')),
+    ('What can you hold without ever touching it? Every witness has held one.', ('conversation', 'a conversation', 'breath', 'your breath', 'a grudge', 'grudge')),
 ]
 
 
@@ -10784,42 +10978,121 @@ def _case_norm(text: str) -> str:
 
 
 _case_cache = {}  # guild_id -> state dict; every message in everyone-chat checks this, so no DB hit per message
+CASE_RECENT_LIMIT = 120  # answers remembered to avoid repeats (~4 months of daily cases)
 
 
 async def _case_state(guild) -> dict:
+    """{'q': question, 'a': [answers], 'date', 'msg_id', 'solved_by', 'source'} or {}."""
     if guild.id in _case_cache:
         return dict(_case_cache[guild.id])
     raw = await get_guild_setting(guild.id, "case_state") or ""
-    parts = raw.split("|")
     st = {}
-    if len(parts) >= 4:
+    if raw.startswith("{"):
         try:
-            st = {"index": int(parts[0]) % len(CASE_FILES), "date": parts[1], "msg_id": parts[2], "solved_by": parts[3]}
+            st = json.loads(raw)
         except ValueError:
             st = {}
+    elif raw:  # pre-10.2 "index|date|msg_id|solved_by" — adopt the open case
+        parts = raw.split("|")
+        if len(parts) >= 4:
+            try:
+                q, ans = CASE_FILES[int(parts[0]) % len(CASE_FILES)]
+                st = {"q": q, "a": list(ans), "date": parts[1], "msg_id": parts[2], "solved_by": parts[3], "source": "bank"}
+            except ValueError:
+                st = {}
     _case_cache[guild.id] = st
     return dict(st)
 
 
 async def _case_save(guild, st: dict):
-    await set_guild_setting(guild.id, "case_state", f"{st['index']}|{st['date']}|{st.get('msg_id', '')}|{st.get('solved_by', '')}")
+    await set_guild_setting(guild.id, "case_state", json.dumps(st))
     _case_cache[guild.id] = dict(st)
 
 
+async def _case_recent_answers(guild) -> list:
+    raw = await get_guild_setting(guild.id, "case_recent") or ""
+    return [x for x in raw.split("|") if x]
+
+
+async def _case_remember(guild, answer: str):
+    recent = await _case_recent_answers(guild)
+    recent.append(_case_norm(answer))
+    await set_guild_setting(guild.id, "case_recent", "|".join(recent[-CASE_RECENT_LIMIT:]))
+
+
+CASE_AI_SYSTEM = (
+    "You write one riddle a day for a friendly police-themed Discord community game. "
+    "Reply with JSON only, no prose, no markdown: "
+    '{"riddle": "...", "answers": ["main answer", "alternate wording", "another alternate"]}. '
+    "Rules: a classic-style riddle or word puzzle, 1-3 sentences, solvable by a normal adult in a minute, "
+    "with ONE clearly correct short answer (1-3 words, a common noun). List 2-4 accepted spellings/phrasings. "
+    "Family-friendly. No trivia, no maths beyond counting, no answers that are a specific person, brand, "
+    "country or date. A light police/detective flavour in the wording is welcome ('the suspect', 'evidence', 'the precinct'). "
+    "Do not reuse any of the answers the user lists as already used."
+)
+
+
+async def generate_case_ai(guild):
+    """(10.2) A brand-new riddle from the configured AI, or None. Validated:
+    JSON, non-empty riddle, sane answer lengths, not a recently used answer."""
+    if not AI_ENABLED:
+        return None
+    recent = await _case_recent_answers(guild)
+    user = "Already used answers (avoid): " + (", ".join(recent[-80:]) or "none") + "\nGive me today's riddle."
+    for _attempt in range(2):
+        text = await ai_complete(CASE_AI_SYSTEM, user, max_tokens=300)
+        if not text:
+            return None
+        m = re.search(r"\{.*\}", text, re.S)
+        if not m:
+            continue
+        try:
+            data = json.loads(m.group(0))
+        except ValueError:
+            continue
+        q = str(data.get("riddle", "")).strip()
+        answers = [str(x).strip() for x in (data.get("answers") or []) if str(x).strip()]
+        if not (15 <= len(q) <= 400) or not answers:
+            continue
+        answers = [x for x in answers if 1 <= len(_case_norm(x)) <= 40][:5]
+        if not answers or _case_norm(answers[0]) in recent:
+            continue
+        if any(_case_norm(x) and _case_norm(x) in _case_norm(q).split() for x in answers if len(_case_norm(x)) >= 4):
+            continue  # the answer is literally in the riddle — too easy
+        return q, answers
+    return None
+
+
+def pick_bank_case(recent: list):
+    """A bank riddle whose answer wasn't used recently (or the least recent one)."""
+    unused = [c for c in CASE_FILES if _case_norm(c[1][0]) not in recent]
+    if unused:
+        return random.choice(unused)
+    pos = {ans: i for i, ans in enumerate(recent)}
+    return min(CASE_FILES, key=lambda c: pos.get(_case_norm(c[1][0]), -1))
+
+
 async def post_daily_case(guild, force: bool = False) -> bool:
-    """Posts today's case. Reveals yesterday's if it went unsolved. force=True
-    (staff /game start case) posts a fresh one even if today's is already up."""
+    """Posts today's case. Reveals the open one first if it went unsolved.
+    force=True (staff /game start case) posts a fresh one even if today's is
+    already up. Riddle comes from the AI when configured, else the bank."""
     ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
     if not ch:
         return False
     st = await _case_state(guild)
     today = datetime.now(await get_guild_timezone(guild.id)).strftime("%Y-%m-%d")
-    if st and st["date"] == today and not force:
+    if st and st.get("date") == today and not force:
         return False
     if st and not st.get("solved_by"):
         await reveal_case(guild, "The whole precinct stared at the evidence board.")
-    idx = (st["index"] + 1) % len(CASE_FILES) if st else random.randrange(len(CASE_FILES))
-    question, _ = CASE_FILES[idx]
+    generated = await generate_case_ai(guild)
+    if generated:
+        question, answers = generated
+        source = "ai"
+    else:
+        question, answers = pick_bank_case(await _case_recent_answers(guild))
+        answers = list(answers)
+        source = "bank"
     embed = discord.Embed(title="🗂️ DAILY CASE FILE", description=f"**{question}**", color=discord.Color.teal())
     embed.add_field(name="📖 How to play", value=game_rules_short("case"), inline=False)
     embed.set_footer(text=f"Type your answer right here. RoboCop is listening — it's literally the only thing it does at night. {boss_quip(guild)}")
@@ -10828,7 +11101,9 @@ async def post_daily_case(guild, force: bool = False) -> bool:
     except discord.HTTPException as e:
         await report_error(guild, "posting the Daily Case File", None, e)
         return False
-    await _case_save(guild, {"index": idx, "date": today, "msg_id": str(msg.id), "solved_by": ""})
+    await _case_save(guild, {"q": question, "a": answers, "date": today, "msg_id": str(msg.id), "solved_by": "", "source": source})
+    await _case_remember(guild, answers[0])
+    await log_event(guild, f"🗂️ **CASE FILE POSTED** ({'AI-written' if source == 'ai' else 'from the bank'}) — answer: ||{answers[0]}||")
     return True
 
 
@@ -10837,7 +11112,7 @@ async def reveal_case(guild, reason: str) -> bool:
     st = await _case_state(guild)
     if not st or st.get("solved_by"):
         return False
-    _, answers = CASE_FILES[st["index"]]
+    answers = st.get("a") or ["???"]
     st["solved_by"] = "nobody"
     await _case_save(guild, st)
     ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
@@ -10849,9 +11124,38 @@ async def reveal_case(guild, reason: str) -> bool:
     return True
 
 
+CASE_FUZZY_MIN = 0.80  # "moooostache" / "mustash" still count for "mustache"
+
+
+def _squash(word: str) -> str:
+    return re.sub(r"(.)\1+", r"\1", word)  # mooostache → mostache
+
+
+def _case_matches(guess: str, normed_answers: list) -> bool:
+    """Exact match always counts. Otherwise: a short message (≤4 words) whose
+    whole text, or one of its words, is close enough to a real-word answer
+    (5+ letters) — typos, doubled letters and enthusiasm all pass; "I saw
+    him" can't close the comb case by accident."""
+    if guess in normed_answers:
+        return True
+    words = guess.split()
+    if len(words) > 4:
+        return False
+    for a in normed_answers:
+        if len(a) < 5:
+            continue
+        candidates = [guess] + (words if " " not in a else [])
+        for c in candidates:
+            if c == a or _squash(c) == _squash(a):
+                return True
+            if SequenceMatcher(None, _squash(c), _squash(a)).ratio() >= CASE_FUZZY_MIN:
+                return True
+    return False
+
+
 async def check_case_answer(message) -> bool:
     """Called from on_message for every human message in #🌍-everyone-chat.
-    One cheap settings read; string compare; awards on the first hit."""
+    Cached state; string compare; awards on the first hit."""
     guild = message.guild
     st = await _case_state(guild)
     if not st or st.get("solved_by"):
@@ -10859,14 +11163,9 @@ async def check_case_answer(message) -> bool:
     guess = _case_norm(message.content)
     if not guess or len(guess) > 60:
         return False
-    _, answers = CASE_FILES[st["index"] % len(CASE_FILES)]
-    words = guess.split()
-    normed = [_case_norm(a) for a in answers]
-    # Exact match always counts. A single answer word inside a SHORT message
-    # ("it's the comb?") counts only when the answer is a real word (5+
-    # letters) — so "I saw him" can't close the comb case by accident.
-    hit = guess in normed or (len(words) <= 4 and any(len(a) >= 5 and " " not in a and a in words for a in normed))
-    if not hit:
+    answers = st.get("a") or []
+    normed = [_case_norm(a) for a in answers if a]
+    if not _case_matches(guess, normed):
         return False
     st["solved_by"] = str(message.author.id)
     await _case_save(guild, st)
@@ -10878,7 +11177,7 @@ async def check_case_answer(message) -> bool:
             f"+{ACHIEVEMENT_WEIGHTS['case_solved']} points and a gold star on the fridge. Next one tomorrow. *{boss_quip(guild)}*", mention_author=False)
     except discord.HTTPException:
         pass
-    await log_event(guild, f"🗂️ **CASE FILE SOLVED** by {message.author.mention} (#{st['index']}).")
+    await log_event(guild, f"🗂️ **CASE FILE SOLVED** by {message.author.mention} — **{answers[0]}**.")
     return True
 
 
@@ -15189,6 +15488,9 @@ HOWDO_TASKS = [
     ("How the games work", "everyone", "how do games work rules how to play cops robbers rogue case file explain game instructions",
      f"Everything is pinned in #{CH_GAMES}: Cops & Robbers (secret roles in private threads, {CHASE_HINT_TIERS} clues, {CHASE_ARRESTS_PER_ROUND} arrests / {CHASE_AMBUSHES_PER_ROUND} ambushes each), "
      f"Rogue RoboCop (`/catch`, {ROGUE_CATCHES_PER_PERSON} tries), the Daily Case File (type the answer in chat) and RPS (for fun)."),
+    ("Post a new Case File (riddle)", "staff", "start new case file post another riddle puzzle fresh case trigger case file now",
+     "`/game action:start game:case` → tap **Start now**. Any open case is revealed first, then a fresh riddle posts in #🌍-everyone-chat. "
+     "`/game action:end game:case` just reveals the answer. The 9am case still runs on its own (`/settings setting:case_hour` changes the time)."),
     ("Solve the Daily Case File", "everyone", "case file riddle daily puzzle answer solve case",
      f"A riddle is posted in #🌍-everyone-chat every morning. Just type your answer in that channel — first correct answer wins {ACHIEVEMENT_WEIGHTS['case_solved']} points."),
     ("Catch the Rogue RoboCop", "everyone", "rogue robocop catch hiding secret identity guess",
