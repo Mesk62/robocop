@@ -26,6 +26,7 @@ Passwords, login codes, account emails, or payment — ever. If anything claimin
 - **Your place in the server:** rank (R4/R5), rank requests, badges like Innovator, and which registration steps you've finished.
 - **Game scores:** Rock-Paper-Scissors, Cops & Robbers, Rogue RoboCop, Daily Case File solves and monthly standings, plus guesses used in the current round (`chase_participants.guesses_used`, `rogue_guesses`), and two rotation counters per player (`chase_stats.last_drafted_round`, `chase_stats.no_show_streak`) so quiet members get their turn and no-shows go to the back of the queue.
 - **The date you last posted** (`users.last_active_at`, day-level, no message content) — only used to put recent chatters at the front of the Cops & Robbers draft.
+- **The date you last made a game move** (`users.last_played_at`) — only people who played in the last 3 days get a heads-up ping when a new Case File or Rogue round opens (at most one every 6 hours). A 🔕 button on that ping opts out for good (stored as a flag in `capability_notifications`). New members get one friendly pointer to the live game ~25 seconds after their welcome, and nothing at all once they've left the server.
 - **Moderation history, if any:** warnings, time-outs, kicks or bans and the reason given, and, if you're ever jailed, the roles you had so they can be handed back.
 
 **Where it's kept:** in a database on the owner's own machine — PostgreSQL, or a local SQLite file if no Postgres is configured. Nothing is sent to any outside database service.

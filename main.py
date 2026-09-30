@@ -1061,6 +1061,11 @@ def init_db():
             cursor.execute("ALTER TABLE user_stats ADD COLUMN case_solves INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+        # 10.2: when someone last made a game move — decides who gets game heads-ups.
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_played_at TIMESTAMP")
+        except sqlite3.OperationalError:
+            pass
         # 10.2: timer clues are capped per Rogue round — survives restarts.
         try:
             cursor.execute("ALTER TABLE rogue_bot_rounds ADD COLUMN timer_hints INTEGER DEFAULT 0")
@@ -1573,7 +1578,58 @@ def boss_name(guild) -> str:
     return name or "the Chief"
 
 
+LEADER_QUIPS = [
+    "{leader} is in first place. Somebody check {leader}'s pockets for extra points.",
+    "{leader} leads the month. Internal Affairs has opened a file. It just says 'suspiciously good'.",
+    "Word is {leader} practises riddles in the mirror. The mirror is tired.",
+    "{leader} is top of the board. Everyone else: this is your cue to ruin their week.",
+    "{leader} hasn't lost a point in days. RoboCop is running a background check.",
+]
+ALLIANCE_QUIPS = [
+    "[{tag}] claims to be the smartest alliance on the server. The Case File would like a word.",
+    "Rumour has it [{tag}] holds meetings about the riddles. Rumour also says they still get them wrong.",
+    "[{tag}] brought snacks to the stakeout. Nobody else did. Points for hospitality, none for stealth.",
+    "[{tag}] says they're 'just here for fun'. That's exactly what a guilty alliance would say.",
+    "If [{tag}] spent as much time on the games as on the group chat, they'd own the leaderboard.",
+]
+ROBOT_QUIPS = [
+    "RoboCop has computed the odds of you winning this month. The odds are 'try harder'.",
+    "This message was written by a robot who has never once found its own car keys.",
+    "RoboCop's hobbies: justice, puns, and pretending to understand emojis.",
+    "RoboCop does not sleep. RoboCop does, however, occasionally stare at a wall for three hours. Unrelated.",
+    "Beep boop. That's robot for 'why is nobody answering the riddle'.",
+    "RoboCop tried to play Rock, Paper, Scissors against itself. It's been a tie since Tuesday.",
+]
+CREW_QUIPS = [
+    "The cops say they're close. The cops have said that since the invention of doughnuts.",
+    "Robbers of the precinct: your disguises are terrible. That is all.",
+    "The Rogue RoboCop sends its regards. It also sends a strong smell of burnt toast. Unrelated, probably.",
+    "Somewhere a Chief is reading this instead of playing. You know who you are.",
+    "The evidence locker is full of wrong answers. Please stop feeding it.",
+]
+_quip_context = {}  # guild_id -> {"leader": name} — refreshed whenever standings are computed
+
+
 def boss_quip(guild) -> str:
+    """(10.2) The precinct's running roast. Mostly the boss, but the month's
+    leader, a random alliance, the robot itself and the players all get their
+    turn — always affectionate, never someone at the bottom of the board."""
+    pools = [("boss", 4), ("robot", 2), ("crew", 2)]
+    leader = _quip_context.get(guild.id, {}).get("leader")
+    if leader:
+        pools.append(("leader", 2))
+    tags = [r.name[:-3] for r in guild.roles if r.name.endswith("-R5")]
+    if tags:
+        pools.append(("alliance", 2))
+    kind = random.choices([k for k, _ in pools], weights=[w for _, w in pools])[0]
+    if kind == "leader":
+        return random.choice(LEADER_QUIPS).format(leader=leader)
+    if kind == "alliance":
+        return random.choice(ALLIANCE_QUIPS).format(tag=tag_display(random.choice(tags)))
+    if kind == "robot":
+        return random.choice(ROBOT_QUIPS)
+    if kind == "crew":
+        return random.choice(CREW_QUIPS)
     return random.choice(BOSS_QUIPS).format(boss=boss_name(guild))
 
 
@@ -3111,7 +3167,6 @@ async def auto_lift_lockdown(guild, delay_seconds):
     await log_event(guild, "🟢 **LOCKDOWN AUTO-LIFTED**\nScheduled duration elapsed.")
 
 
-VERSION_HANDOFF_LOCKDOWN_SECONDS = 60
 
 
 async def announce_version_handoff(guild):
@@ -3130,9 +3185,7 @@ async def announce_version_handoff(guild):
         title="🚨📢 ATTENTION ALL UNITS — PRECINCT-WIDE UPGRADE IN EFFECT 📢🚨",
         description=(
             "**BY ORDER OF COMMAND:** the old unit has been decommissioned. A new one has taken the badge, "
-            f"full systems overhaul, top to bottom. Comms are down for about {VERSION_HANDOFF_LOCKDOWN_SECONDS} "
-            "seconds while the transition completes — stand by, hold position, this is not a drill.\n\n"
-            "Once comms are restored, here's what's now active precinct-wide:"
+            "full systems overhaul, top to bottom. Here's what's now active precinct-wide:"
         ),
         color=discord.Color.blue(),
         timestamp=datetime.now()
@@ -3182,15 +3235,16 @@ async def announce_version_handoff(guild):
     )
     embed.set_footer(text="This precinct is now fully operational. Move out.")
 
-    targets = await gather_all_community_channels(guild)
-    for ch in targets:
+    # (10.2) Everyone-chat only, silent, no chat pause — it used to go to every
+    # precinct channel and every alliance lobby and lock chat for a minute,
+    # which read as spam. Alliance channels are the alliance's own.
+    ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
+    if ch:
         try:
-            await ch.send(embed=embed)
+            await ch.send(embed=embed, silent=True)
         except discord.HTTPException:
             pass
-
-    await engage_lockdown(guild, VERSION_HANDOFF_LOCKDOWN_SECONDS)
-    await log_event(guild, f"🔄 **VERSION UPDATE** — chat locked for {VERSION_HANDOFF_LOCKDOWN_SECONDS}s while the new instance takes over.")
+    await log_event(guild, f"🔄 **VERSION UPDATE** — announced in #{CH_EVERYONE} (no chat pause).")
 
     if rogue_enabled:
         started = await start_rogue_bot_round(guild, announce=False)  # the handoff embed above already announced it
@@ -3839,6 +3893,64 @@ async def check_critical_security(guild):
             except discord.HTTPException as e:
                 dangers.append(f"Couldn't fix a channel permission ({e}) — check I have Manage Channels.")
             repairs.append("Prisoners couldn't actually see **#⛓️-solitary-confinement** — reapplied their access so the punishment is usable.")
+
+    # 5. (10.2) Alliance chats are the alliance's business alone — not even
+    #    Judges or Senators. Only the alliance's own roles ([TAG], [TAG]-R4,
+    #    -R5, -Leadership), the punishment roles (which only ever DENY) and
+    #    RoboCop itself may have an overwrite on an alliance category or its
+    #    channels; anything else (hand-added roles, individual people,
+    #    leftovers from an adoption) is removed. The alliance's R5 moderates.
+    try:
+        async with db_connect() as conn:
+            cur = await conn.cursor()
+            await cur.execute("SELECT tag FROM alliances")
+            alliance_tags = [row[0] for row in await cur.fetchall()]
+        removed_total, touched = 0, []
+        for tag in alliance_tags:
+            tag_role = discord.utils.get(guild.roles, name=tag)
+            allowed_names = {ROLE_DRUNK_TANK, ROLE_PRISONER, ROLE_TIMEOUT}
+            for cat_name in (f"{tag} CHATS", f"{tag} Voice Channels"):
+                cat = discord.utils.get(guild.categories, name=cat_name)
+                if not cat:
+                    continue
+                removed_here = 0
+                for place in [cat] + list(cat.channels):
+                    for target in list(place.overwrites):
+                        if target == guild.default_role or target == guild.me:
+                            continue
+                        if isinstance(target, discord.Role) and (target.name == tag or target.name.startswith(f"{tag}-") or target.name in allowed_names or target.managed):
+                            continue
+                        try:
+                            await place.set_permissions(target, overwrite=None, reason=f"Alliance chats are [{tag}]'s alone")
+                            removed_here += 1
+                        except discord.HTTPException as e:
+                            dangers.append(f"Couldn't tidy access on **{place.name}** ({e}) — check I have Manage Channels.")
+                            break
+                # the category itself: hidden from everyone, visible to the alliance
+                try:
+                    if cat.overwrites_for(guild.default_role).view_channel is not False:
+                        await cat.set_permissions(guild.default_role, view_channel=False, reason="Alliance chats are private")
+                        removed_here += 1
+                    if tag_role and cat.overwrites_for(tag_role).view_channel is not True:
+                        await cat.set_permissions(tag_role, view_channel=True, reason="Alliance can see its own chats")
+                except discord.HTTPException:
+                    pass
+                if removed_here:
+                    removed_total += removed_here
+                    touched.append(tag_display(tag))
+        if removed_total:
+            repairs.append(f"🔒 Alliance chats tightened: removed **{removed_total}** outside permission(s) from "
+                           f"{', '.join(sorted(set(touched)))[:600]} — only each alliance's own members (and its R5 as moderator) can see them now.")
+    except Exception as e:
+        dangers.append(f"Couldn't check alliance chat privacy: {type(e).__name__}: {e}")
+
+    # 6. Administrator sees every channel — Discord's rule, no overwrite can
+    #    stop it. Only the Dictator role should carry it.
+    admin_roles = [r for r in guild.roles if r.permissions.administrator and not r.managed and r.name != ROLE_DICTATOR and not r.is_default()]
+    if admin_roles:
+        dangers.append("These roles have Discord's **Administrator** permission, so they can see *every* alliance's private chats no matter what I set: "
+                       + ", ".join(f"**@{r.name}**" for r in admin_roles[:10])
+                       + ". If they shouldn't, untick Administrator on them in Server Settings → Roles.")
 
     # 🗄️ Duplicate per-alliance categories (e.g. two "[TAG] CHATS") are never
     # auto-merged or deleted — that's destructive. Just flagged for a human
@@ -4924,7 +5036,7 @@ COMMAND_SPECIAL_NOTES = {
     "alliance": "rename: the alliance's own R5 or Judge+. approve: Judge+. dissolve/lock/unlock/burst: Senator+. Same tag on two servers? Type e.g. `HAL-121`.",
     "admin-tools": "set-member, re-check-nicknames and enforce-registration: Judge+. add-request-role and fresh-start: Senator+. Everything else: Dictator.",
     "grant-rank": "Same tag on two servers? Type the tag and server, e.g. `HAL-121`.",
-    "announce": "Scope depends on rank: Member reaches the current channel (1/hr), an alliance R5 reaches all of that alliance's channels (1/30min), staff reach the whole server (no limit).",
+    "announce": "Your own text: a Member reaches the current channel (1/hr), an R5 their alliance's channels (1/30min), staff the whole server. Staff also get ready-made posts (games, prize, leaderboard, newcomers) in everyone-chat.",
     "leadership": "R5-only — enforced internally, not by a Discord permission.",
     "safety": "Anyone can read it. Staff can add `post_here: True` to post and pin it for everyone.",
 }
@@ -5176,7 +5288,8 @@ async def restore_persistent_views():
     bot.add_view(BulkAutoRegisterView())  # same idea — persists the startup-diagnostic bulk button
     bot.add_view(AbilitiesReferenceView())  # persists the #❓-abilities "Show Full Verbose List" button
     bot.add_view(SettingsPanelView())  # persists the #⚙️-settings buttons
-    bot.add_view(ChaseRosterView())  # persists every "Count me in" button (announcements, settings, invite DMs)
+    bot.add_view(ChaseRosterView())
+    bot.add_view(GamePingsView())  # (10.2) the 🔕 button on game heads-ups  # persists every "Count me in" button (announcements, settings, invite DMs)
     bot.add_view(MemberRescueView())  # persists the 🔄 Fresh start buttons on every trouble post
 
     cutoff = (datetime.now() - timedelta(days=14)).isoformat()
@@ -5394,7 +5507,8 @@ PRIVACY_NOTE = (
     "and which registration steps you've finished.\n"
     "• **Game scores:** Rock-Paper-Scissors, Cops & Robbers, Rogue RoboCop, Daily Case File solves and monthly standings "
     "(plus how many guesses you've used in the current round).\n"
-    "• **The date you last posted** (day-level, no message content) — people who've chatted recently go to the front of the Cops & Robbers draft. "
+    "• **The date you last posted and last played a game** (no message content) — recent chatters go to the front of the Cops & Robbers draft, "
+    "and only people who've played in the last few days get a heads-up ping when a new game opens (🔕 turns that off). "
     "Tap *Not for me* in #⚙️-settings to never be drafted.\n"
     "• **Moderation history, if any:** warnings, time-outs, kicks or bans and the reason given — and, if you "
     "ever land in jail, the roles you had so I can hand them back when you're released.\n\n"
@@ -5942,9 +6056,9 @@ def game_rules_text(game: str) -> str:
             f"**How a round goes** (needs {CHASE_MIN_PARTICIPANTS}+ players)\n"
             "1️⃣ RoboCop secretly makes ~1 in 3 players **cops**. Everyone else is a **robber** (always at least 2). "
             "You find out in a **private thread** (cops in one, robbers in another) — no DMs.\n"
-            f"2️⃣ Over the round, the cops' thread gets **{CHASE_HINT_TIERS} clues** about who the robbers are — server, tag, first letter, name length… each one warmer than the last.\n"
+            f"2️⃣ Clues drop **automatically** — nothing to ask for. The cops' thread gets **{CHASE_HINT_TIERS} clues** about the robbers, evenly spaced across the round (server, tag, first letter, name length… each warmer than the last). Every clue says when the next one lands.\n"
             "3️⃣ **Cops:** `/arrest <name>` when you think you know a robber. Close counts — name, tag, server all help.\n"
-            "4️⃣ **Robbers:** `/ambush <name>` to knock a cop out first. Guess right and they're out of the round.\n"
+            f"4️⃣ **Robbers:** `/ambush <name>` to knock a cop out first. Guess right and they're out of the round. Your thread gets **{ROBBER_CLUE_COUNT} tail reports** about the cops — a step behind, and never quite as sharp.\n"
             f"5️⃣ Cops get **{CHASE_ARRESTS_PER_ROUND} arrests** per round, robbers **{CHASE_AMBUSHES_PER_ROUND} ambushes** — so don't spray names, use the clues.\n\n"
             "**How it ends:** all robbers caught → cops win. Time runs out with a robber still free → robbers win. "
             "Only players who made at least one move score — sitting in a thread doesn't count.\n"
@@ -5958,7 +6072,7 @@ def game_rules_text(game: str) -> str:
             "It occasionally chimes in on the conversation — and every line it says leaks a little about who it is.\n\n"
             "**How to play**\n"
             "• Read what it says. Its comments are clues (a rank, an animal, a habit…).\n"
-            f"• When chat is quiet, it drops a fresh clue on its own about every {ROGUE_HINT_INTERVAL_SECONDS // 3600} hour(s).\n"
+            f"• Clues are **automatic**: every line it says is one, and if chat goes quiet for an hour it drops a fresh one on its own (up to 4).\n"
             "• `/catch <name>` when you think you've made it. Only you see the answer.\n"
             f"• You get **{ROGUE_CATCHES_PER_PERSON} catches** per round — make them count.\n\n"
             f"**Points:** first correct catch wins **{w['rogue_catch']}** — the biggest single score in the precinct. "
@@ -7504,7 +7618,7 @@ class RPSView(discord.ui.View):
     """Rock/Paper/Scissors: vs another member, or solo vs Robocop if no opponent given."""
 
     def __init__(self, player1: discord.Member, player2: Optional[discord.Member]):
-        super().__init__(timeout=60.0)
+        super().__init__(timeout=300.0)  # (10.2) 5 minutes for the other player to show up
         self.player1 = player1
         self.player2 = player2
         self.choices = {}
@@ -7558,14 +7672,14 @@ class RPSView(discord.ui.View):
             waiting_on = self.player2 if key == self.player1.id else self.player1
             try:
                 await interaction.message.edit(embed=discord.Embed(
-                    title="🎮 STREET JUSTICE SHOWDOWN",
+                    title="✂️ ROCK · PAPER · SCISSORS — just for fun, not a game clue",
                     description=(
                         f"{self.player1.mention} vs {self.player2.mention}\n\n"
                         f"✅ {chooser.mention} has chosen their weapon!\n"
                         f"⏳ Waiting on {waiting_on.mention}..."
                     ),
                     color=discord.Color.blurple()
-                ), view=self)
+                ), view=self)  # still needed: the other player hasn't picked yet
             except discord.HTTPException:
                 pass
 
@@ -7604,9 +7718,12 @@ class RPSView(discord.ui.View):
             await increment_user_stat(self.player1.id, "rps_losses")
             if self.player2:
                 await increment_user_stat(self.player2.id, "rps_wins")
+        await note_played(self.player1.id)
+        if self.player2:
+            await note_played(self.player2.id)
 
         embed = discord.Embed(
-            title="🎮 STREET JUSTICE SHOWDOWN — RESULTS",
+            title="✂️ ROCK · PAPER · SCISSORS — RESULT",
             description=(
                 f"🎯 {self.player1.mention} has answered with **{p1_choice}**!\n"
                 f"🎯 {p2_label} has answered with **{p2_choice}**!\n\n"
@@ -7616,7 +7733,7 @@ class RPSView(discord.ui.View):
             color=color
         )
         try:
-            await interaction.message.edit(embed=embed, view=self)
+            await interaction.message.edit(embed=embed, view=None)  # match over — no leftover buttons
         except discord.HTTPException:
             pass
         self.stop()
@@ -7644,7 +7761,7 @@ class RPSView(discord.ui.View):
             # bail out quietly rather than risk a confusing message.
             try:
                 if self.message:
-                    await self.message.edit(view=self)
+                    await self.message.edit(view=None)
             except discord.HTTPException:
                 pass
             self.stop()
@@ -7662,7 +7779,7 @@ class RPSView(discord.ui.View):
         flavor = random.choice(pool).format(ghost=ghost.mention, opponent=opponent.mention)
 
         embed = discord.Embed(
-            title="🎮 STREET JUSTICE SHOWDOWN — CALLED ON A TECHNICALITY",
+            title="✂️ ROCK · PAPER · SCISSORS — NO-SHOW",
             description=(
                 f"{self.player1.mention} vs {self.player2.mention}\n\n"
                 f"⏱️ {flavor}\n\n"
@@ -7672,7 +7789,7 @@ class RPSView(discord.ui.View):
         )
         try:
             if self.message:
-                await self.message.edit(embed=embed, view=self)
+                await self.message.edit(embed=embed, view=None)
         except discord.HTTPException:
             pass
         self.stop()
@@ -8302,6 +8419,7 @@ async def on_member_remove(member):
     task = _resume_tasks.pop(member.id, None)
     if task:
         task.cancel()
+    cancel_member_pokes(member.id)  # (10.2) gone = left alone: no poke, no pings
     await log_visitor_exit(member)
 
 
@@ -8724,6 +8842,147 @@ async def build_arrival_line(name: str) -> str:
     return pick_flavor(ARRIVAL_PLAIN_TEMPLATES, "arrival_plain").format(name=name)
 
 
+# ------------------------------------------------------------
+#  (10.2) ENGAGEMENT — poke new arrivals once, keep active players in the
+#  loop, and leave everyone else alone.
+#   • A new member gets ONE friendly poke in everyone-chat ~25 s after the
+#     welcome rhyme, pointing at whatever game is live right now. Cancelled
+#     if they leave before it fires. Never repeated.
+#   • "Active" = made a game move in the last GAME_ACTIVE_DAYS days
+#     (users.last_played_at). Only active players get a heads-up ping when a
+#     new game opens — at most one every GAME_PING_GAP_HOURS, and a
+#     "🔕 No game pings" button stops them for good. Go quiet for a few days
+#     and the pings stop by themselves; play again and they resume.
+#   • Anyone who has left the server is skipped everywhere.
+# ------------------------------------------------------------
+ARRIVAL_POKE_DELAY_SECONDS = 25
+GAME_ACTIVE_DAYS = 3
+GAME_PING_GAP_HOURS = 6
+GAME_PING_MAX_MENTIONS = 20
+_arrival_pokes = {}      # user_id -> task (cancelled on leave)
+_last_game_ping = {}     # user_id -> monotonic time of their last heads-up
+
+
+async def note_played(user_id: int):
+    """Record a real game move — keeps this person on the heads-up list."""
+    try:
+        async with db_connect() as conn:
+            cur = await conn.cursor()
+            await cur.execute("UPDATE users SET last_played_at = ? WHERE user_id = ?", (datetime.now().isoformat(), user_id))
+            await conn.commit()
+    except Exception as e:
+        print(f"[ENGAGE] couldn't note a game move for {user_id}: {e}")
+
+
+async def live_game_pitch(guild) -> str:
+    """One line pointing at the best thing to do right now."""
+    st = await _case_state(guild)
+    if st and not st.get("solved_by") and st.get("q"):
+        return f"🗂️ Today's **Case File** is still unsolved:\n> **{st['q'][:300]}**\nJust type your answer here — first right answer wins **{ACHIEVEMENT_WEIGHTS['case_solved']} points**."
+    if await get_active_rogue_round(guild):
+        return f"🕵️ A **Rogue RoboCop** is hiding in this very channel under a fake name. Spot it and `/catch name:<guess>` for **{ACHIEVEMENT_WEIGHTS['rogue_catch']} points**."
+    if await get_active_chase_round(guild):
+        return "🚔 A **Cops & Robbers** round is on right now — you're in the next draft automatically. Watch this channel for the reveal."
+    return f"🎮 Next up: the daily Cops & Robbers manhunt and a riddle every morning — you're already entered. `/rps` someone while you wait."
+
+
+@guarded_task("arrival poke")
+async def _arrival_poke(guild, member):
+    try:
+        await asyncio.sleep(ARRIVAL_POKE_DELAY_SECONDS)
+        if not guild.get_member(member.id):
+            return  # they've already gone — leave them alone
+        ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
+        if not ch:
+            return
+        prize = await get_guild_setting(guild.id, "monthly_prize") or DEFAULT_MONTHLY_PRIZE
+        await ch.send(
+            f"👀 Psst, {member.mention} — you're officially in the running for **{prize}** this month.\n"
+            f"{await live_game_pitch(guild)}\n"
+            f"How everything works: **#{CH_GAMES}**. *{boss_quip(guild)}*")
+        await mark_capabilities_notified(member.id, ["poke:arrival"])
+    finally:
+        _arrival_pokes.pop(member.id, None)
+
+
+async def schedule_arrival_poke(guild, member):
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        await cur.execute("SELECT 1 FROM capability_notifications WHERE user_id = ? AND capability = 'poke:arrival'", (member.id,))
+        if await cur.fetchone():
+            return  # already poked once, ever
+    if member.id not in _arrival_pokes:
+        _arrival_pokes[member.id] = bot.loop.create_task(_arrival_poke(guild, member))
+
+
+def cancel_member_pokes(member_id: int):
+    task = _arrival_pokes.pop(member_id, None)
+    if task:
+        task.cancel()
+    _last_game_ping.pop(member_id, None)
+
+
+async def ping_active_players(guild, ch, what: str, exclude: set = None):
+    """ONE line mentioning the people who've actually been playing, when a
+    new game opens. Nobody idle, nobody who opted out, nobody who's left,
+    and never the same person twice within GAME_PING_GAP_HOURS."""
+    cutoff = datetime.now() - timedelta(days=GAME_ACTIVE_DAYS)
+    async with db_connect() as conn:
+        cur = await conn.cursor()
+        await cur.execute("SELECT user_id, last_played_at FROM users WHERE last_played_at IS NOT NULL")
+        rows = await cur.fetchall()
+        await cur.execute("SELECT user_id FROM capability_notifications WHERE capability = 'pref:no_game_pings'")
+        muted = {r[0] for r in await cur.fetchall()}
+    now_ts = time.monotonic()
+    targets = []
+    for uid, played in rows:
+        when = parse_db_local_time(played)
+        if not when or when < cutoff or uid in muted or (exclude and uid in exclude):
+            continue
+        if now_ts - _last_game_ping.get(uid, 0) < GAME_PING_GAP_HOURS * 3600:
+            continue
+        m = guild.get_member(uid)
+        if m and not m.bot:
+            targets.append(m)
+    if not targets:
+        return
+    targets = targets[:GAME_PING_MAX_MENTIONS]
+    for m in targets:
+        _last_game_ping[m.id] = now_ts
+    try:
+        await ch.send(f"🔔 {' '.join(m.mention for m in targets)} — you've been playing lately, so here's your heads-up: {what}",
+                      view=GamePingsView(), allowed_mentions=discord.AllowedMentions(users=targets, roles=False, everyone=False))
+    except discord.HTTPException as e:
+        await report_error(guild, "game heads-up ping", None, e)
+
+
+class GamePingsView(discord.ui.View):
+    """🔕 on every heads-up line: one tap and that person never gets game pings again."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="No game pings for me", style=discord.ButtonStyle.secondary, emoji="🔕", custom_id="rc_game_pings_off")
+    async def off(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await mark_capabilities_notified(interaction.user.id, ["pref:no_game_pings"])
+        _last_game_ping[interaction.user.id] = time.monotonic()
+        await interaction.response.send_message("🔕 Done — no more game pings. The bulletin in this channel still shows what's live whenever you look. "
+                                                "Changed your mind? Tap the button below.", view=GamePingsOnView(), ephemeral=True)
+
+
+class GamePingsOnView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600.0)
+
+    @discord.ui.button(label="Turn game pings back on", style=discord.ButtonStyle.success, emoji="🔔")
+    async def on(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with db_connect() as conn:
+            cur = await conn.cursor()
+            await cur.execute("DELETE FROM capability_notifications WHERE user_id = ? AND capability = 'pref:no_game_pings'", (interaction.user.id,))
+            await conn.commit()
+        await interaction.response.send_message("🔔 Back on. You'll get a heads-up when a new game opens (only while you're playing).", ephemeral=True)
+
+
 async def post_arrival_welcome(guild, member, in_game_name: str):
     """The public hello in 🌍-everyone-chat once someone finishes registering."""
     ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
@@ -8734,6 +8993,7 @@ async def post_arrival_welcome(guild, member, in_game_name: str):
         await ch.send(f"{line}\n👋 {member.mention}")
     except discord.HTTPException as e:
         await report_error(guild, "arrival welcome in everyone-chat", member, e)
+    await schedule_arrival_poke(guild, member)
 
 
 # ------------------------------------------------------------
@@ -10095,8 +10355,9 @@ async def _start_chase_round_locked(guild, started_by: str) -> tuple:
         description=(
             (f"Somewhere among you, {len(cops)} cop(s) and {len(robbers)} robber(s) walk unseen. Each side knows its own — "
             "the other side is anyone's guess.\n\n"
-            f"The round runs for **{round_hours} hours**. {CHASE_HINT_TIERS} clues drop over the round, in secret, to the cops "
-            "alone. Cuff every robber and it ends early. When it ends, everything gets revealed.\n\n"
+            f"The round runs for **{round_hours} hours**. Clues drop **automatically** in the private threads — the cops get "
+            f"{CHASE_HINT_TIERS}, one about every {int(chase_hint_interval_seconds(round_hours) // 60)} minutes; the robbers get 4 about the cops. "
+            "Cuff every robber and it ends early. When it ends, everything gets revealed.\n\n"
             "Drafted? Then there's a **private thread** waiting for you in this channel with your role. Good luck out there.\n\n")
             + ("*Not in this one? Everyone's in the rotation — " + (f"{benched} are up next; " if benched else "") + "chat today and you're first in line tomorrow.*")
         ),
@@ -10128,7 +10389,7 @@ CHASE_SIDES = {
     "cop": {
         "column": "cop_thread_id", "name": "🚔 cops-only · round {rid}", "reason": "Cops & Robbers — cops' clue room for this round",
         "intro": ("🚔 **You've been deputized — cops-only.** {n} of you, {hours} hours, and the robbers don't know who you are.\n"
-                  "Clues about the robbers drop in this thread {tiers} times across the round, each one warmer. Compare notes, split the suspects, "
+                  "Clues about the robbers drop **automatically** in this thread, {tiers} of them spread across the round, each one warmer — nothing to ask for. Compare notes, split the suspects, "
                   "then `/arrest name:<their name>` (works from anywhere). Warm guesses get a 🔥; cold ones a ❄️. "
                   "**You get {tries} arrests each — make them count.** Robbers can `/ambush` you back, so don't get cocky. {quip}"),
         "dm": "🚔 **You've been deputized** in this round's Cops & Robbers ({hours} h). Clues come by DM. `/arrest name:<their name>` — {tries} tries. Tell no one.",
@@ -10138,11 +10399,44 @@ CHASE_SIDES = {
         "column": "robber_thread_id", "name": "🕶️ getaway car · round {rid}", "reason": "Cops & Robbers — robbers' room for this round",
         "intro": ("🕶️ **You're on the run — robbers only.** {n} of you. The cops are getting clues about you across the next {hours} hours, "
                   "each one warmer. **Survive to the end and you win.** Or strike first: `/ambush name:<a cop's name>` (works from anywhere) — "
-                  "**{tries} tries each.** I'll warn you in here when someone's getting warm. Keep your head down out there. {quip}"),
+                  "**{tries} tries each.** Your lookout will post 4 tail reports about the cops in here automatically, and I'll warn you when someone's getting warm. Keep your head down out there. {quip}"),
         "dm": "🕶️ **You're on the run** in this round's Cops & Robbers ({hours} h). Survive, or `/ambush name:<a cop>` — {tries} tries. Tell no one.",
         "tries": CHASE_AMBUSHES_PER_ROUND,
     },
 }
+
+
+def build_side_briefing(side: str, n: int, round_hours: int) -> discord.Embed:
+    """(10.2) The full instructions for your side, pinned in your private
+    thread — the one place a drafted player needs to look."""
+    gap = int(chase_hint_interval_seconds(round_hours) // 60)
+    w = ACHIEVEMENT_WEIGHTS
+    if side == "cop":
+        e = discord.Embed(title="📋 COP BRIEFING — read me first", color=discord.Color.blue())
+        e.add_field(name="🎯 Your job", value="Find the robbers hiding among everyone in chat and **arrest** them before the round ends.", inline=False)
+        e.add_field(name="🔎 Clues", value=f"**{CHASE_HINT_TIERS} clues** drop in this thread **automatically**, about one every {gap} min. "
+                                           "Each one is warmer: server → tag letter → name length → first letter → full tag → half the name. "
+                                           "Every clue tells you when the next one lands.", inline=False)
+        e.add_field(name="🚔 How to arrest", value=f"Type `/arrest name:<their name>` — from **any** channel. Only you see the reply.\n"
+                                                   f"Example: `/arrest name:Ghost` · close counts: name, tag and server all help.\n"
+                                                   f"**{CHASE_ARRESTS_PER_ROUND} arrests each** — a 🔥 means warm, ❄️ means cold.", inline=False)
+        e.add_field(name="⚠️ Watch out", value="Robbers can `/ambush` you. Get ambushed and you're out of the round. "
+                                               "Don't announce you're a cop in public chat — talk it over in here.", inline=False)
+        e.add_field(name="🏆 Points", value=f"{w['chase_move']} for making a move · {w['chase_arrest']} per arrest · {w['chase_cop_win']} if you collar someone. "
+                                            "Cuff every robber and the round ends early.", inline=False)
+    else:
+        e = discord.Embed(title="📋 GETAWAY BRIEFING — read me first", color=discord.Color.dark_grey())
+        e.add_field(name="🎯 Your job", value=f"**Stay free** until the round ends ({round_hours} h). The cops are hunting you.", inline=False)
+        e.add_field(name="🕶️ Tail reports", value=f"**{ROBBER_CLUE_COUNT} reports about the cops** drop in this thread **automatically**, a step behind the cops' clues. "
+                                                  "I'll also warn you in here when a cop's guess gets warm on one of you.", inline=False)
+        e.add_field(name="🥷 How to ambush", value=f"Type `/ambush name:<a cop's name>` — from **any** channel. Only you see the reply.\n"
+                                                   f"Example: `/ambush name:Mesk` · close counts: name, tag and server all help.\n"
+                                                   f"**{CHASE_AMBUSHES_PER_ROUND} ambushes each** — waiting for a tail report is smart.", inline=False)
+        e.add_field(name="⚠️ Stay hidden", value="Act normal in public chat. Never say you're a robber outside this thread — plot in here.", inline=False)
+        e.add_field(name="🏆 Points", value=f"{w['chase_move']} for making a move · {w['chase_ambush']} per ambush · {w['chase_robber_win']} if you're never caught. "
+                                            "(Only players who make at least one move score.)", inline=False)
+    e.set_footer(text=f"{n} on your side · full rules in #{CH_GAMES} · `/chase` shows your status")
+    return e
 
 
 async def create_side_thread(guild, general_ch, round_id: int, side: str, members: list, round_hours: int):
@@ -10162,9 +10456,14 @@ async def create_side_thread(guild, general_ch, round_id: int, side: str, member
                 await thread.add_user(m)
             except discord.HTTPException:
                 missed.append(m)
-        await thread.send(
+        briefing = await thread.send(
             " ".join(m.mention for m in members) + "\n"
-            + cfg["intro"].format(n=len(members), hours=round_hours, tiers=CHASE_HINT_TIERS, tries=cfg["tries"], quip=boss_quip(guild)))
+            + cfg["intro"].format(n=len(members), hours=round_hours, tiers=CHASE_HINT_TIERS, tries=cfg["tries"], quip=boss_quip(guild)),
+            embed=build_side_briefing(side, len(members), round_hours))
+        try:
+            await briefing.pin()  # the rules stay one tap away for the whole round
+        except discord.HTTPException:
+            pass
     except discord.HTTPException as e:
         print(f"[CHASE] {side} thread failed ({type(e).__name__}: {e}) — telling them by DM instead.")
         missed = list(members)
@@ -10177,7 +10476,7 @@ async def create_side_thread(guild, general_ch, round_id: int, side: str, member
     if missed:
         for m in missed:
             try:
-                await m.send(cfg["dm"].format(hours=round_hours, tries=cfg["tries"]))
+                await m.send(cfg["dm"].format(hours=round_hours, tries=cfg["tries"]), embed=build_side_briefing(side, len(members), round_hours))
             except discord.HTTPException:
                 pass
         await log_event(guild, f"ℹ️ Cops & Robbers round #{round_id}: {len(missed)} {side}(s) couldn't be added to the private thread — told by DM: "
@@ -10227,7 +10526,44 @@ async def load_chase_identities(user_ids: list) -> dict:
         return {r[0]: r[1:] for r in await cur.fetchall()}
 
 
-async def send_chase_hints(guild, round_id: int, tier: int):
+# (10.2) Robbers get 4 "tail reports" about the cops — one step behind the
+# cops' clues, and never the two strongest tiers (full tag, half the name),
+# so the hunters keep their edge but the robbers aren't ambushing blind.
+# cop clue tier -> robber tail-report tier
+ROBBER_CLUE_SCHEDULE = {2: 1, 3: 2, 4: 3, 5: 4}
+ROBBER_CLUE_COUNT = len(ROBBER_CLUE_SCHEDULE)
+
+
+async def _post_to_side(guild, round_id: int, side: str, member_ids: list, embed):
+    """Post in that side's private thread; DM the side if the thread is gone."""
+    thread = await get_side_thread(guild, round_id, side)
+    if thread is not None:
+        try:
+            await thread.send(embed=embed)
+            return
+        except discord.HTTPException as e:
+            print(f"[CHASE] {side} thread post failed ({e}) — falling back to DMs for this clue.")
+    for uid in member_ids:
+        m = guild.get_member(uid)
+        if m:
+            try:
+                await m.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+
+def _clue_lines(guild, ids: list, identities: dict, tier: int, label: str) -> list:
+    lines = []
+    for i, uid in enumerate(ids, start=1):
+        member = guild.get_member(uid)
+        if not member:
+            continue
+        tag, servers, base_name = get_chase_target_identity(member, identities.get(uid))
+        lines.append(f"**{label} #{i}:** {build_hint_text(tier, tag, servers, base_name)}")
+    return lines
+
+
+async def send_chase_hints(guild, round_id: int, tier: int, next_at=None):
     async with db_connect() as conn:
         cur = await conn.cursor()
         await cur.execute("SELECT user_id FROM chase_participants WHERE round_id = ? AND role = 'cop' AND eliminated = 0", (round_id,))
@@ -10238,37 +10574,32 @@ async def send_chase_hints(guild, round_id: int, tier: int):
     if not cops or not robber_ids:
         return
 
-    identities = await load_chase_identities(robber_ids)
-    lines = []
-    for i, uid in enumerate(robber_ids, start=1):
-        member = guild.get_member(uid)
-        if not member:
-            continue
-        tag, servers, base_name = get_chase_target_identity(member, identities.get(uid))
-        lines.append(f"**Suspect #{i}:** {build_hint_text(tier, tag, servers, base_name)}")
+    identities = await load_chase_identities(robber_ids + cops)
+    lines = _clue_lines(guild, robber_ids, identities, tier, "Suspect")
+    when = (f"⏰ Next clue drops automatically <t:{int(next_at.timestamp())}:R>." if next_at
+            else "🏁 That's the last clue — it's all on you now.")
 
     embed = discord.Embed(
         title=f"🔎 CLUE {tier} OF {CHASE_HINT_TIERS}",
-        description="\n\n".join(lines) if lines else "Every suspect is already in a cell. Go get a donut, Chief.",
+        description=("\n\n".join(lines) if lines else "Every suspect is already in a cell. Go get a donut, Chief.") + f"\n\n{when}",
         color=discord.Color.gold(),
         timestamp=datetime.now()
     )
     embed.set_footer(text=f"Cuffs are in the glovebox: /arrest <name>. {CHASE_ARRESTS_PER_ROUND} pairs each — don't waste them on your partner.")
+    await _post_to_side(guild, round_id, "cop", cops, embed)
 
-    thread = await get_side_thread(guild, round_id, "cop")
-    if thread is not None:
-        try:
-            await thread.send(embed=embed)
-            return
-        except discord.HTTPException as e:
-            print(f"[CHASE] Cops' thread post failed ({e}) — falling back to DMs for this clue.")
-    for cop_id in cops:
-        cop = guild.get_member(cop_id)
-        if cop:
-            try:
-                await cop.send(embed=embed)
-            except discord.Forbidden:
-                pass
+    # 🕶️ The robbers' tail report — about the cops, one step behind.
+    robber_tier = ROBBER_CLUE_SCHEDULE.get(tier)
+    if robber_tier:
+        n = sorted(ROBBER_CLUE_SCHEDULE).index(tier) + 1
+        tail_when = (f"⏰ Next tail report <t:{int(next_at.timestamp())}:R>." if next_at and n < ROBBER_CLUE_COUNT
+                     else "🏁 That's your last tail report — trust your instincts.")
+        tail = discord.Embed(
+            title=f"🕶️ TAIL REPORT {n} OF {ROBBER_CLUE_COUNT}",
+            description=("\n\n".join(_clue_lines(guild, cops, identities, robber_tier, "Cop")) or "No cops left standing. Enjoy the quiet.") + f"\n\n{tail_when}",
+            color=discord.Color.dark_grey(), timestamp=datetime.now())
+        tail.set_footer(text=f"Your lookout's notes on the cops hunting you. Strike first: /ambush <name> — {CHASE_AMBUSHES_PER_ROUND} tries each.")
+        await _post_to_side(guild, round_id, "robber", robber_ids, tail)
 
 
 async def post_chase_leaderboard(guild):
@@ -10460,8 +10791,8 @@ async def run_chase_round_timers(guild, round_id: int):
 
             if now >= next_hint_at and last_tier < CHASE_HINT_TIERS:
                 new_tier = last_tier + 1
-                await send_chase_hints(guild, round_id, new_tier)
                 new_next = now + timedelta(seconds=chase_hint_interval_seconds(round_hours))
+                await send_chase_hints(guild, round_id, new_tier, next_at=new_next if new_tier < CHASE_HINT_TIERS and new_next < ends_at else None)
                 async with db_connect() as conn:
                     cur = await conn.cursor()
                     await cur.execute("UPDATE chase_rounds SET last_hint_tier = ?, next_hint_at = ? WHERE round_id = ?", (new_tier, new_next.isoformat(), round_id))
@@ -10546,6 +10877,7 @@ async def announce_rogue_round(guild, ends_at):
         await ch.send(embed=embed)
     except discord.HTTPException:
         pass
+    await ping_active_players(guild, ch, f"a 🕵️ **Rogue RoboCop** is hiding in this channel. First `/catch` wins **{ACHIEVEMENT_WEIGHTS['rogue_catch']} points**.")
 
 
 ROGUE_TIMER_HINTS_MAX = 4
@@ -11112,6 +11444,7 @@ async def post_daily_case(guild, force: bool = False) -> bool:
         return False
     await _case_save(guild, {"q": question, "a": answers, "date": today, "msg_id": str(msg.id), "solved_by": "", "source": source})
     await _case_remember(guild, answers[0])
+    await ping_active_players(guild, ch, "a fresh 🗂️ **Case File** just landed above. First right answer takes the points.")
     await log_event(guild, f"🗂️ **CASE FILE POSTED** ({'AI-written' if source == 'ai' else 'from the bank'}) — answer: ||{answers[0]}||")
     return True
 
@@ -11179,6 +11512,7 @@ async def check_case_answer(message) -> bool:
     st["solved_by"] = str(message.author.id)
     await _case_save(guild, st)
     await increment_user_stat(message.author.id, "case_solves")
+    await note_played(message.author.id)
     _leaderboard_cache.pop(guild.id, None)
     try:
         await message.reply(
@@ -11670,11 +12004,114 @@ async def approve_tag(interaction: discord.Interaction, tag: str):
     await interaction.response.send_message(f"✅ Tag [{tag}] approved and released from the Drunk Tank.")
 
 
-@bot.tree.command(name="announce", description="Broadcast an announcement — scope and cooldown depend on your rank.")
-@app_commands.describe(message="The announcement text")
-async def announce(interaction: discord.Interaction, message: str):
+ANNOUNCE_KINDS = [
+    app_commands.Choice(name="message — post your own text (default)", value="message"),
+    app_commands.Choice(name="games — what's live right now, the prize and the race (staff)", value="games"),
+    app_commands.Choice(name="prize — this month's prize, how to win it, who's leading (staff)", value="prize"),
+    app_commands.Choice(name="leaderboard — all-time top 10 plus this month's race (staff)", value="leaderboard"),
+    app_commands.Choice(name="newcomers — welcome everyone who joined this week (staff)", value="newcomers"),
+]
+
+
+async def build_prize_embed(guild):
+    prize = await get_guild_setting(guild.id, "monthly_prize") or DEFAULT_MONTHLY_PRIZE
+    now = datetime.now(await get_guild_timezone(guild.id))
+    first_of_next = (now.replace(day=1) + timedelta(days=32)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    embed = discord.Embed(title="🏆 THIS MONTH'S PRIZE", description=f"# {prize}\nHighest points when the month ends takes it. **Everyone's already entered** — nothing to join.",
+                          color=discord.Color.gold(), timestamp=datetime.now())
+    w = ACHIEVEMENT_WEIGHTS
+    embed.add_field(name="💰 How to earn points", value=(
+        f"🕵️ Catch the Rogue RoboCop — **{w['rogue_catch']}**\n"
+        f"🚔 Cops & Robbers — **{w['chase_move']}** per move, **{w['chase_arrest']}** per arrest/ambush, **{w['chase_cop_win']}** for a win\n"
+        f"🗂️ Solve the Case File — **{w['case_solved']}**\n"
+        f"✂️ RPS and badges are for glory only"), inline=False)
+    standings = await compute_monthly_champion_standings(guild)
+    if standings:
+        lines = [f"{MEDAL_LABEL[i] if i < 3 else f'#{i+1}'} — {(guild.get_member(uid).display_name if guild.get_member(uid) else '?')} ({pts} pts)" for i, (uid, pts, _) in enumerate(standings[:5])]
+        embed.add_field(name="📊 The race so far", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="📊 The race so far", value="Nobody's scored yet. The first point of the month takes the lead.", inline=False)
+    embed.add_field(name="⏰ Winner announced", value=f"<t:{int(first_of_next.timestamp())}:R>", inline=True)
+    embed.add_field(name="📖 How to play", value=f"#{CH_GAMES}", inline=True)
+    embed.set_footer(text=boss_quip(guild))
+    return embed
+
+
+async def build_leaderboard_embed(guild):
+    board = await compute_leaderboard(guild, force_refresh=True)
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"{medals[i] if i < 3 else f'**#{i+1}**'} {(guild.get_member(uid).display_name if guild.get_member(uid) else '?')} — {score} pts"
+             for i, (uid, score, _) in enumerate(board[:10])]
+    embed = discord.Embed(title="🏆 PRECINCT LEADERBOARD", description="\n".join(lines) or "Nobody's on the board yet — go make some history.",
+                          color=discord.Color.gold(), timestamp=datetime.now())
+    standings = await compute_monthly_champion_standings(guild)
+    if standings:
+        embed.add_field(name="📅 This month's race", value=" · ".join(
+            f"{MEDAL_LABEL[i]} {(guild.get_member(uid).display_name if guild.get_member(uid) else '?')} ({pts})" for i, (uid, pts, _) in enumerate(standings[:3])), inline=False)
+    embed.set_footer(text=f"Not on it? /stats shows how far you've got to climb. {boss_quip(guild)}")
+    return embed
+
+
+async def build_newcomers_embed(guild):
+    cutoff = discord.utils.utcnow() - timedelta(days=7)
+    member_role = discord.utils.get(guild.roles, name=ROLE_MEMBER)
+    fresh = sorted([m for m in guild.members if not m.bot and m.joined_at and m.joined_at >= cutoff and member_role in m.roles],
+                   key=lambda m: m.joined_at)
+    if not fresh:
+        return None
+    names = ", ".join(f"**{strip_nickname_decorations(m.display_name) or m.name}**" for m in fresh[:40])
+    extra = f" and {len(fresh) - 40} more" if len(fresh) > 40 else ""
+    embed = discord.Embed(title=f"👋 WELCOME TO THE PRECINCT — {len(fresh)} NEW FACE{'S' if len(fresh) != 1 else ''} THIS WEEK",
+                          description=f"{names}{extra}\n\nSay hi, show them the ropes, and maybe let them win one riddle before you crush them.",
+                          color=discord.Color.green(), timestamp=datetime.now())
+    embed.add_field(name="New here? Start with…", value=f"📖 **#{CH_GAMES}** · ⚙️ **#{CH_SETTINGS}** · `@RoboCop how do I…?`", inline=False)
+    embed.set_footer(text=boss_quip(guild))
+    return embed
+
+
+@bot.tree.command(name="announce", description="Post your own announcement, or (staff) the live games, prize, leaderboard or newcomers.")
+@app_commands.describe(what="Blank = your own text. Staff can also post the live games, the prize, the leaderboard or newcomers.",
+                       message="Your text. Optional with the staff options — it goes on top of that post.")
+@app_commands.choices(what=ANNOUNCE_KINDS)
+async def announce(interaction: discord.Interaction, what: str = "message", message: Optional[str] = None):
     guild = interaction.guild
     user = interaction.user
+    if not guild:
+        await interaction.response.send_message("🚔 This only works inside the server itself, not in a DM.", ephemeral=True)
+        return
+    if what != "message":
+        if not await _has_rank(interaction, "staff"):
+            return
+        await interaction.response.defer(ephemeral=True)
+        ch = discord.utils.get(guild.text_channels, name=CH_EVERYONE)
+        if not ch:
+            await interaction.followup.send("❌ Couldn't find #🌍-everyone-chat.", ephemeral=True)
+            return
+        if what == "games":
+            embed = await build_bulletin_embed(guild)
+        elif what == "prize":
+            embed = await build_prize_embed(guild)
+        elif what == "leaderboard":
+            embed = await build_leaderboard_embed(guild)
+        else:
+            embed = await build_newcomers_embed(guild)
+            if embed is None:
+                await interaction.followup.send("👋 Nobody new joined in the last 7 days — nothing to announce yet.", ephemeral=True)
+                return
+        try:
+            await ch.send(content=(f"📢 **{message[:1800]}**" if message else None), embed=embed,
+                          allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False))
+        except discord.HTTPException as e:
+            await report_error(guild, f"/announce {what}", user, e)
+            await interaction.followup.send("❌ Couldn't post it — check #logs.", ephemeral=True)
+            return
+        await interaction.followup.send(f"📢 Posted the **{what}** announcement in {ch.mention}.", ephemeral=True)
+        await log_event(guild, f"📢 **ANNOUNCEMENT ({what})** by {user.mention}" + (f"\nMessage: {message[:500]}" if message else ""))
+        return
+    if not message:
+        await interaction.response.send_message(
+            "✍️ Add your text in the `message` box — or pick one of the ready-made posts in `what` (games, prize, leaderboard, newcomers).", ephemeral=True)
+        return
     now_ts = time.monotonic()
 
     if is_staff_member(user):
@@ -13315,6 +13752,9 @@ async def _resolve_chase_guess(interaction: discord.Interaction, guess_text: str
         used = (await cur.fetchone())[0]
         left = max(0, limit - used)
         left_note = f" *({left} {singular if left == 1 else plural} left this round)*"
+    await note_played(interaction.user.id)
+    async with db_connect() as conn:
+        cur = await conn.cursor()
         await cur.execute(
             "SELECT user_id FROM chase_participants WHERE round_id = ? AND role = ? AND eliminated = 0",
             (round_id, target_role)
@@ -13486,6 +13926,7 @@ async def catch_cmd(interaction: discord.Interaction, name: str):
         used = (await cur.fetchone())[0]
         await cur.execute("UPDATE rogue_bot_rounds SET last_activity_at = ? WHERE round_id = ?", (datetime.now().isoformat(), round_id))
         await conn.commit()
+    await note_played(interaction.user.id)
     left = max(0, ROGUE_CATCHES_PER_PERSON - used)
     left_note = f" ({left} catch{'es' if left != 1 else ''} left)" if left > 0 else " (that was your last catch this round)"
     guess_clean = clean_display_name(name)
@@ -13719,12 +14160,38 @@ async def rps(interaction: discord.Interaction, opponent: discord.Member = None)
     view = RPSView(interaction.user, opponent)
     vs_text = opponent.mention if opponent else "**Robocop**"
     embed = discord.Embed(
-        title="🎮 STREET JUSTICE SHOWDOWN",
-        description=f"{interaction.user.mention} vs {vs_text}\nChoose your weapon below — picks are hidden until everyone's locked in!",
+        title="✂️ ROCK · PAPER · SCISSORS — just for fun, not a game clue",
+        description=f"{interaction.user.mention} vs {vs_text}\nChoose your weapon below — picks are hidden until everyone's locked in!"
+                    + (f"\n⏳ {opponent.mention} has 5 minutes to pick." if opponent else ""),
         color=discord.Color.blurple()
     )
     await interaction.response.send_message(embed=embed, view=view)
     view.message = await interaction.original_response()
+    if opponent:
+        await notify_rps_challenge(interaction, opponent, view.message)
+
+
+async def notify_rps_challenge(interaction, opponent, match_msg):
+    """(10.2) A mention inside an embed never notifies anyone — the challenged
+    player used to have no idea. One private DM with a jump button; if their
+    DMs are closed, ONE ping in the channel instead. Nothing else."""
+    challenger = interaction.user.display_name
+    dm = discord.Embed(
+        title="⚔️ YOU'VE BEEN CHALLENGED!",
+        description=(f"**{challenger}** just called you out to **Rock, Paper, Scissors** in **{interaction.guild.name}**.\n\n"
+                     f"Tap below, pick your weapon, and defend your honour. You've got **5 minutes** before they claim you chickened out."),
+        color=discord.Color.orange())
+    dm.set_footer(text="Just for fun — RPS wins go on your record, not the prize board.")
+    jump = discord.ui.View()
+    jump.add_item(discord.ui.Button(label="Take me to the duel", emoji="⚔️", url=match_msg.jump_url))
+    try:
+        await opponent.send(embed=dm, view=jump)
+    except discord.HTTPException:
+        try:
+            await match_msg.channel.send(f"⚔️ {opponent.mention}, **{challenger}** challenged you — pick your weapon above! (5 minutes)",
+                                         allowed_mentions=discord.AllowedMentions(users=[opponent]))
+        except discord.HTTPException:
+            pass
 
 
 async def enforce_registration(interaction: discord.Interaction, member: discord.Member):
@@ -14365,6 +14832,15 @@ MEDAL_LABEL = {0: "🥇 Gold", 1: "🥈 Silver", 2: "🥉 Bronze"}
 
 
 async def compute_monthly_champion_standings(guild) -> list:
+    result = await _compute_monthly_champion_standings(guild)
+    if result:
+        m = guild.get_member(result[0][0])
+        if m:
+            _quip_context[guild.id] = {"leader": strip_nickname_decorations(m.display_name) or m.name}
+    return result
+
+
+async def _compute_monthly_champion_standings(guild) -> list:
     """Returns [(user_id, month_score, breakdown), ...] sorted descending,
     keeping only members with a positive gain since the last baseline
     snapshot. Members with no baseline row yet are treated as starting
@@ -15598,7 +16074,7 @@ HOWDO_TASKS = [
     ("Audit everyone's nicknames", "staff", "nicknames audit check names fix all nicknames wrong",
      "`/admin-tools tool:re-check-nicknames` — Judge+. Finds nicknames that don't match roles and posts one-click fixes to #logs. (It also runs at every startup.)"),
     ("Announce a new version of RoboCop", "dictator", "announce update new version release handoff",
-     "`/admin-tools tool:announce-update` — Dictator. Posts the upgrade notice everywhere and pauses chat for 60 s."),
+     "`/admin-tools tool:announce-update` — Dictator. Posts the upgrade notice in everyone-chat (silently) and starts a Rogue round if that's on."),
     ("Announce the Monthly Champion now", "staff", "monthly champion announce now winner prize",
      "`/monthly-champions-now` — Judge+. Announces and resets the month's standings. Change the prize with `/settings setting:monthly_prize`."),
     ("Innovator badges", "dictator", "innovator badge give badge grant everyone restore badges early tester",
@@ -15623,6 +16099,9 @@ HOWDO_TASKS = [
     ("How the games work", "everyone", "how do games work rules how to play cops robbers rogue case file explain game instructions",
      f"Everything is pinned in #{CH_GAMES}: Cops & Robbers (secret roles in private threads, {CHASE_HINT_TIERS} clues, {CHASE_ARRESTS_PER_ROUND} arrests / {CHASE_AMBUSHES_PER_ROUND} ambushes each), "
      f"Rogue RoboCop (`/catch`, {ROGUE_CATCHES_PER_PERSON} tries), the Daily Case File (type the answer in chat) and RPS (for fun)."),
+    ("Announce the prize, games, leaderboard or newcomers", "staff", "announce prize announce games leaderboard post newcomers welcome announcement broadcast tell everyone",
+     "`/announce what:prize` (or `games`, `leaderboard`, `newcomers`) posts a ready-made announcement in #🌍-everyone-chat. Add `message:` to put your own words on top. "
+     "`/announce message:...` alone posts your own text server-wide."),
     ("The hourly Precinct Bulletin", "staff", "bulletin hourly announcement what's live games status every hour turn off bulletin",
      "Every hour RoboCop posts one silent bulletin in #🌍-everyone-chat (open Case File, Rogue, chase status, prize). It replaces the last one, so it never stacks. "
      "Change how often: `/settings setting:bulletin_hours value:2` (every 2 hours) — `0` turns it off."),
@@ -16832,7 +17311,7 @@ async def _set_member_dispatch(interaction: discord.Interaction, member: Optiona
     app_commands.Choice(name="add-request-role — add a role to the /request menu (Senator+; needs role + description)", value="addrole"),
     app_commands.Choice(name="fresh-start — wipe everything about one person so they can try again (Senator+)", value="forget"),
     app_commands.Choice(name="fresh-start-and-invite — same, plus a one-use invite DMed to them (Senator+)", value="forget_invite"),
-    app_commands.Choice(name="announce-update — fire the 'new version' announcement + 60s chat pause (Dictator)", value="announce"),
+    app_commands.Choice(name="announce-update — post the 'new version' announcement in everyone-chat (Dictator)", value="announce"),
     app_commands.Choice(name="database-panel — post the release-prisoners / reset-database panel to #logs (Dictator)", value="db"),
     app_commands.Choice(name="adopt-alliance — fold an existing alliance's channels into our structure (Dictator; needs tag)", value="adopt"),
     app_commands.Choice(name="migrate-legacy-roles — map old rank/admin roles into the new system (Dictator)", value="migrate"),
@@ -16875,7 +17354,7 @@ async def admin_tools_cmd(interaction: discord.Interaction, tool: str, tag: Opti
         if not await _has_rank(interaction, "dictator"):
             return
         if tool == "announce":
-            await _confirm(interaction, f"📢 Post the **precinct-wide upgrade** announcement to every community channel and pause chat for {VERSION_HANDOFF_LOCKDOWN_SECONDS} seconds? "
+            await _confirm(interaction, f"📢 Post the **upgrade** announcement in #{CH_EVERYONE}? "
                                         "(Also starts a Rogue RoboCop round if that program is on.)", announce_update, yes_label="Announce", danger=True)
         elif tool == "db":
             await database_tools(interaction)  # posts a panel; the panel's own buttons confirm
